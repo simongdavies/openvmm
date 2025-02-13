@@ -89,7 +89,7 @@ impl Builder<'_> {
 
         // Common page sizes are 4KiB, 16KiB, and 64KiB. The stack size must be a multiple
         // of the page size.
-        let stack_len: usize = std::cmp::max(16 * 1024, page_size);
+        let stack_len: usize = std::cmp::max(32 * 1024, page_size);
         assert!(stack_len % page_size == 0);
 
         // Create a stack with one guard page.
