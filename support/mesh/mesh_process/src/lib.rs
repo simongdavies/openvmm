@@ -51,6 +51,7 @@ use pal_async::task::Spawn;
 use pal_async::task::Task;
 use slab::Slab;
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs::File;
 #[cfg(unix)]
@@ -447,7 +448,7 @@ pub enum InheritedResourceTarget {
     Handle(usize),
 }
 
-/// Resources intentionally inherited by a checked mesh host.
+/// Resources intentionally inherited by a mesh host.
 ///
 /// Sandbox profiles must declare every resource they add to the process
 /// builder.
@@ -496,6 +497,28 @@ impl InheritedResourceManifest {
 
 /// Sandbox profile trait used for mesh hosts.
 pub trait SandboxProfile: Send {
+    /// Configures the process command before constructing the platform process
+    /// builder.
+    ///
+    /// This can wrap the worker with an external launcher. A transformed
+    /// command must preserve the process identity and lifetime tracked by
+    /// [`Mesh`], normally by replacing the launcher process image with the
+    /// worker. It must also preserve every declared inherited resource.
+    ///
+    /// Resources needed by a transformed command must be declared here.
+    /// Adding resources later in [`Self::prepare`] is rejected for transformed
+    /// commands because the launcher could not account for them.
+    ///
+    /// Mesh-managed invitation and checked-startup environment variables are
+    /// added after both profile hooks and cannot be removed by the profile.
+    fn configure_launch(
+        &mut self,
+        _launch: &mut ProcessLaunch,
+        _inherited_resources: &mut InheritedResourceManifest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Apply executes in the parent context and configures any sandbox
     /// features that will be applied to the newly created process via
     /// the pal builder object.
@@ -537,6 +560,82 @@ pub trait SandboxProfile: Send {
     ) -> anyhow::Result<()> {
         let _ = inherited_resources;
         self.finalize()
+    }
+}
+
+/// A platform-neutral process command prepared for a mesh host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessLaunch {
+    program: PathBuf,
+    arg0: Option<OsString>,
+    args: Vec<OsString>,
+    env_vars: Vec<(OsString, OsString)>,
+}
+
+impl ProcessLaunch {
+    fn new(
+        program: PathBuf,
+        arg0: Option<OsString>,
+        args: Vec<OsString>,
+        env_vars: Vec<(OsString, OsString)>,
+    ) -> Self {
+        Self {
+            program,
+            arg0,
+            args,
+            env_vars,
+        }
+    }
+
+    /// Returns the executable path.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Replaces the executable path.
+    pub fn set_program(&mut self, program: impl Into<PathBuf>) {
+        self.program = program.into();
+    }
+
+    /// Returns the explicit `argv[0]`, if one was configured.
+    pub fn arg0(&self) -> Option<&OsStr> {
+        self.arg0.as_deref()
+    }
+
+    /// Replaces the explicit `argv[0]`.
+    pub fn set_arg0(&mut self, arg0: Option<OsString>) {
+        self.arg0 = arg0;
+    }
+
+    /// Returns the command arguments after `argv[0]`.
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// Returns mutable command arguments after `argv[0]`.
+    pub fn args_mut(&mut self) -> &mut Vec<OsString> {
+        &mut self.args
+    }
+
+    /// Returns the caller-configured environment variables.
+    pub fn env_vars(&self) -> &[(OsString, OsString)] {
+        &self.env_vars
+    }
+
+    /// Returns mutable caller-configured environment variables.
+    pub fn env_vars_mut(&mut self) -> &mut Vec<(OsString, OsString)> {
+        &mut self.env_vars
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        Option<OsString>,
+        Vec<OsString>,
+        Vec<(OsString, OsString)>,
+    ) {
+        (self.program, self.arg0, self.args, self.env_vars)
     }
 }
 
@@ -1245,11 +1344,9 @@ impl MeshInner {
         let checked = checked_startup.is_some();
         #[cfg(windows)]
         let connection;
-        if checked {
-            inherited_resources.declare("stdin", InheritedResourceTarget::StandardInput)?;
-            inherited_resources.declare("stdout", InheritedResourceTarget::StandardOutput)?;
-            inherited_resources.declare("stderr", InheritedResourceTarget::StandardError)?;
-        }
+        inherited_resources.declare("stdin", InheritedResourceTarget::StandardInput)?;
+        inherited_resources.declare("stdout", InheritedResourceTarget::StandardOutput)?;
+        inherited_resources.declare("stderr", InheritedResourceTarget::StandardError)?;
 
         // If no process name was passed, use the current executable path to
         // ensure we get the right file, but set arg0 to match how this process
@@ -1264,6 +1361,7 @@ impl MeshInner {
         };
 
         let name = config.name.clone();
+        let mut sandbox_profile = config.sandbox_profile;
 
         #[cfg(windows)]
         let child = {
@@ -1272,12 +1370,10 @@ impl MeshInner {
             connection = invitation_connection;
             node_id = invitation.node_id();
             let (credentials, directory) = invitation.into_parts();
-            if checked {
-                inherited_resources.declare(
-                    "mesh-ipc",
-                    InheritedResourceTarget::Handle(directory.as_raw_handle() as usize),
-                )?;
-            }
+            inherited_resources.declare(
+                "mesh-ipc",
+                InheritedResourceTarget::Handle(directory.as_raw_handle() as usize),
+            )?;
 
             let invitation_env = base64::engine::general_purpose::STANDARD.encode(
                 mesh::payload::encode(Invitation {
@@ -1291,37 +1387,52 @@ impl MeshInner {
             if !config.skip_worker_arg {
                 args.push(name.clone().into());
             }
-
-            let mut builder = process::Builder::from_args(
-                arg0.as_ref()
-                    .map_or_else(|| process_name.as_os_str(), |x| x.as_os_str()),
-                &args,
-            );
-            if arg0.is_some() {
-                builder.application_name(process_name.as_path());
-            }
-            builder
-                .stdin(process::Stdio::Null)
-                .stdout(process::Stdio::Null)
-                .handle(&directory)
-                .env(INVITATION_ENV_NAME, invitation_env)
-                .extend_env(config.env_vars)
-                .job(self.job.as_handle());
-
-            if let Some(log_file) = config.stderr.as_ref() {
-                builder.stderr(process::Stdio::Handle(log_file.as_handle()));
-            }
-
-            if let Some(mut sandbox_profile) = config.sandbox_profile {
+            let mut launch =
+                ProcessLaunch::new(process_name.into_owned(), arg0, args, config.env_vars);
+            let original_launch = launch.clone();
+            if let Some(sandbox_profile) = sandbox_profile.as_mut() {
                 requires_child_finalize = sandbox_profile.requires_child_finalize();
                 anyhow::ensure!(
                     checked || !requires_child_finalize,
                     "sandbox profile requires checked child finalization"
                 );
                 sandbox_profile
+                    .configure_launch(&mut launch, &mut inherited_resources)
+                    .context("failed to configure process launch")?;
+            }
+            let launch_transformed = launch != original_launch;
+            let configured_resources = inherited_resources.clone();
+            let (process_name, arg0, args, env_vars) = launch.into_parts();
+
+            let mut builder = process::Builder::from_args(
+                arg0.as_ref()
+                    .map_or_else(|| process_name.as_os_str(), OsString::as_os_str),
+                &args,
+            );
+            if arg0.is_some() {
+                builder.application_name(&process_name);
+            }
+            builder
+                .stdin(process::Stdio::Null)
+                .stdout(process::Stdio::Null)
+                .handle(&directory)
+                .extend_env(env_vars)
+                .job(self.job.as_handle());
+
+            if let Some(log_file) = config.stderr.as_ref() {
+                builder.stderr(process::Stdio::Handle(log_file.as_handle()));
+            }
+
+            if let Some(sandbox_profile) = sandbox_profile.as_mut() {
+                sandbox_profile
                     .prepare(&mut builder, &mut inherited_resources)
                     .context("failed to prepare sandbox profile")?;
             }
+            anyhow::ensure!(
+                !launch_transformed || inherited_resources == configured_resources,
+                "sandbox profile declared inherited resources after transforming the process launch"
+            );
+            builder.env(INVITATION_ENV_NAME, invitation_env);
             if checked {
                 builder.env(
                     CHECKED_STARTUP_ENV_NAME,
@@ -1351,10 +1462,8 @@ impl MeshInner {
                 .context("mesh node invite error")?;
 
             node_id = invitation.address.local_addr.node;
-            if checked {
-                inherited_resources
-                    .declare("mesh-ipc", InheritedResourceTarget::FileDescriptor(IPC_FD))?;
-            }
+            inherited_resources
+                .declare("mesh-ipc", InheritedResourceTarget::FileDescriptor(IPC_FD))?;
 
             let invitation_env = base64::engine::general_purpose::STANDARD.encode(
                 mesh::payload::encode(Invitation {
@@ -1364,39 +1473,55 @@ impl MeshInner {
                 }),
             );
 
-            let mut command = process::Builder::new(process_name.into_owned());
-            if let Some(arg0) = arg0 {
-                command.arg0(arg0);
-            }
-            command
-                .args(&config.process_args)
-                .stdin(process::Stdio::Null)
-                .stdout(process::Stdio::Null)
-                .dup_fd(invitation.fd.as_fd(), IPC_FD)
-                .env(INVITATION_ENV_NAME, invitation_env);
-
-            for (key, value) in &config.env_vars {
-                command.env(key, value);
-            }
-
+            let mut args = config.process_args;
             if !config.skip_worker_arg {
-                command.arg(&name);
+                args.push(name.clone().into());
             }
-
-            if let Some(log_file) = config.stderr.as_ref() {
-                command.stderr(process::Stdio::Fd(log_file.as_fd()));
-            }
-
-            if let Some(mut sandbox_profile) = config.sandbox_profile {
+            let mut launch =
+                ProcessLaunch::new(process_name.into_owned(), arg0, args, config.env_vars);
+            let original_launch = launch.clone();
+            if let Some(sandbox_profile) = sandbox_profile.as_mut() {
                 requires_child_finalize = sandbox_profile.requires_child_finalize();
                 anyhow::ensure!(
                     checked || !requires_child_finalize,
                     "sandbox profile requires checked child finalization"
                 );
                 sandbox_profile
+                    .configure_launch(&mut launch, &mut inherited_resources)
+                    .context("failed to configure process launch")?;
+            }
+            let launch_transformed = launch != original_launch;
+            let configured_resources = inherited_resources.clone();
+            let (process_name, arg0, args, env_vars) = launch.into_parts();
+
+            let mut command = process::Builder::new(process_name);
+            if let Some(arg0) = arg0 {
+                command.arg0(arg0);
+            }
+            command
+                .args(&args)
+                .stdin(process::Stdio::Null)
+                .stdout(process::Stdio::Null)
+                .dup_fd(invitation.fd.as_fd(), IPC_FD);
+
+            for (key, value) in &env_vars {
+                command.env(key, value);
+            }
+
+            if let Some(log_file) = config.stderr.as_ref() {
+                command.stderr(process::Stdio::Fd(log_file.as_fd()));
+            }
+
+            if let Some(sandbox_profile) = sandbox_profile.as_mut() {
+                sandbox_profile
                     .prepare(&mut command, &mut inherited_resources)
                     .context("failed to prepare sandbox profile")?;
             }
+            anyhow::ensure!(
+                !launch_transformed || inherited_resources == configured_resources,
+                "sandbox profile declared inherited resources after transforming the process launch"
+            );
+            command.env(INVITATION_ENV_NAME, invitation_env);
             if checked {
                 command.env(
                     CHECKED_STARTUP_ENV_NAME,
@@ -1638,6 +1763,8 @@ mod tests {
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::task::Spawn;
+    #[cfg(unix)]
+    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use test_with_tracing::test;
@@ -1664,6 +1791,83 @@ mod tests {
 
         fn requires_child_finalize(&self) -> bool {
             self.requires_finalize
+        }
+    }
+
+    struct FailingLaunchProfile;
+
+    impl SandboxProfile for FailingLaunchProfile {
+        fn configure_launch(
+            &mut self,
+            _launch: &mut ProcessLaunch,
+            _inherited_resources: &mut InheritedResourceManifest,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test launch transformation failed")
+        }
+    }
+
+    struct LateResourceProfile;
+
+    impl SandboxProfile for LateResourceProfile {
+        fn configure_launch(
+            &mut self,
+            launch: &mut ProcessLaunch,
+            _inherited_resources: &mut InheritedResourceManifest,
+        ) -> anyhow::Result<()> {
+            launch.set_program("mesh-process-test-must-not-spawn");
+            Ok(())
+        }
+
+        fn prepare(
+            &mut self,
+            _builder: &mut ProcessBuilder<'_>,
+            inherited_resources: &mut InheritedResourceManifest,
+        ) -> anyhow::Result<()> {
+            #[cfg(unix)]
+            inherited_resources
+                .declare("late-resource", InheritedResourceTarget::FileDescriptor(4))?;
+            #[cfg(windows)]
+            inherited_resources.declare("late-resource", InheritedResourceTarget::Handle(4))?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    struct WrapperProfile {
+        wrapper: PathBuf,
+        saw_mesh_resource: Arc<AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl SandboxProfile for WrapperProfile {
+        fn configure_launch(
+            &mut self,
+            launch: &mut ProcessLaunch,
+            inherited_resources: &mut InheritedResourceManifest,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                inherited_resources.get("mesh-ipc")
+                    == Some(&InheritedResourceTarget::FileDescriptor(IPC_FD)),
+                "mesh IPC descriptor is missing before launch transformation"
+            );
+            self.saw_mesh_resource.store(true, Ordering::Release);
+
+            let worker = launch.program().to_owned();
+            launch.set_program(&self.wrapper);
+            launch.set_arg0(None);
+            launch.args_mut().insert(0, worker.into_os_string());
+            launch
+                .env_vars_mut()
+                .push(("MESH_TEST_PROFILE_ENV".into(), "profile-environment".into()));
+            launch.env_vars_mut().push((
+                INVITATION_ENV_NAME.into(),
+                "invalid-profile-invitation".into(),
+            ));
+            launch.env_vars_mut().push((
+                CHECKED_STARTUP_ENV_NAME.into(),
+                "invalid-profile-startup".into(),
+            ));
+            Ok(())
         }
     }
 
@@ -1834,6 +2038,137 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_checked_launch_reports_transformation_failure() {
+        let mesh = Mesh::new("checked-transform".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                ProcessConfig::new_with_checked_sandbox("checked", Box::new(FailingLaunchProfile))
+                    .process_name("mesh-process-test-must-not-spawn")
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::checked_child",
+                        "--nocapture",
+                    ])
+                    .skip_worker_arg(true),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("failed to configure process launch"));
+        assert!(error.contains("test launch transformation failed"));
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_transformed_launch_rejects_late_resource_declaration() {
+        let mesh = Mesh::new("checked-late-resource".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                ProcessConfig::new_with_checked_sandbox("checked", Box::new(LateResourceProfile))
+                    .process_name(std::env::current_exe().unwrap())
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        "tests::checked_child",
+                        "--nocapture",
+                    ])
+                    .skip_worker_arg(true),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("declared inherited resources after transforming the process launch")
+        );
+        mesh.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[async_test]
+    async fn test_checked_launch_through_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("mesh-test-wrapper");
+        let args_file = directory.path().join("args");
+        let env_file = directory.path().join("env");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$@\" > \"$MESH_TEST_ARGS_FILE\"\n\
+             printf '%s\\n%s\\n' \"$MESH_TEST_CONFIG_ENV\" \
+             \"$MESH_TEST_PROFILE_ENV\" > \"$MESH_TEST_ENV_FILE\"\n\
+             exec \"$@\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+
+        let saw_mesh_resource = Arc::new(AtomicBool::new(false));
+        let mesh = Mesh::new("checked-wrapper".to_string()).unwrap();
+        let worker = std::env::current_exe().unwrap();
+        let pid = mesh
+            .launch_host(
+                ProcessConfig::new_with_checked_sandbox(
+                    "checked",
+                    Box::new(WrapperProfile {
+                        wrapper,
+                        saw_mesh_resource: saw_mesh_resource.clone(),
+                    }),
+                )
+                .process_name(&worker)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::finalized_child",
+                    "--nocapture",
+                ])
+                .env([
+                    (
+                        OsString::from("MESH_TEST_ARGS_FILE"),
+                        args_file.clone().into_os_string(),
+                    ),
+                    (
+                        OsString::from("MESH_TEST_ENV_FILE"),
+                        env_file.clone().into_os_string(),
+                    ),
+                    (
+                        OsString::from("MESH_TEST_CONFIG_ENV"),
+                        OsString::from("config-environment"),
+                    ),
+                ])
+                .skip_worker_arg(true),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap();
+        assert_ne!(pid, 0);
+        assert!(saw_mesh_resource.load(Ordering::Acquire));
+
+        let args = std::fs::read_to_string(args_file).unwrap();
+        let mut args = args.lines();
+        assert_eq!(args.next(), Some(worker.to_str().unwrap()));
+        assert_eq!(
+            args.collect::<Vec<_>>(),
+            [
+                "--ignored",
+                "--exact",
+                "tests::finalized_child",
+                "--nocapture"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(env_file).unwrap(),
+            "config-environment\nprofile-environment\n"
+        );
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
     async fn test_checked_launch_times_out() {
         let mesh = Mesh::new("checked-timeout".to_string()).unwrap();
         let error = mesh
@@ -1957,6 +2292,41 @@ mod tests {
             manifest
                 .declare("second", InheritedResourceTarget::FileDescriptor(4))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn process_launch_accessors_preserve_command_shape() {
+        let mut launch = ProcessLaunch::new(
+            PathBuf::from("worker"),
+            Some(OsString::from("worker-arg0")),
+            vec![OsString::from("first")],
+            vec![(OsString::from("KEY"), OsString::from("value"))],
+        );
+        assert_eq!(launch.program(), Path::new("worker"));
+        assert_eq!(launch.arg0(), Some(OsStr::new("worker-arg0")));
+        assert_eq!(launch.args(), [OsString::from("first")]);
+        assert_eq!(
+            launch.env_vars(),
+            [(OsString::from("KEY"), OsString::from("value"))]
+        );
+
+        launch.set_program("wrapper");
+        launch.set_arg0(None);
+        launch.args_mut().insert(0, OsString::from("worker"));
+        launch
+            .env_vars_mut()
+            .push((OsString::from("ADDED"), OsString::from("profile")));
+        let (program, arg0, args, env_vars) = launch.into_parts();
+        assert_eq!(program, PathBuf::from("wrapper"));
+        assert_eq!(arg0, None);
+        assert_eq!(args, [OsString::from("worker"), OsString::from("first")]);
+        assert_eq!(
+            env_vars,
+            [
+                (OsString::from("KEY"), OsString::from("value")),
+                (OsString::from("ADDED"), OsString::from("profile"))
+            ]
         );
     }
 
