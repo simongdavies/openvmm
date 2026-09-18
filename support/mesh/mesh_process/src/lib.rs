@@ -31,6 +31,7 @@ use inspect::Inspect;
 use inspect::SensitivityLevel;
 use mesh::MeshPayload;
 use mesh::OneshotReceiver;
+use mesh::OneshotSender;
 use mesh::local_node::Port;
 use mesh::message::MeshField;
 use mesh::payload::Protobuf;
@@ -59,6 +60,7 @@ use std::os::windows::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 use tracing::Instrument;
 use tracing::instrument;
 use unicycle::FuturesUnordered;
@@ -86,6 +88,9 @@ const IPC_FD: i32 = 3;
 /// line argument so that other processes cannot steal the invitation details
 /// and use it to break into the mesh.
 const INVITATION_ENV_NAME: &str = "MESH_WORKER_INVITATION";
+const CHECKED_STARTUP_ENV_NAME: &str = "MESH_WORKER_CHECKED_STARTUP";
+const HOST_PROTOCOL_VERSION: u32 = 1;
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Protobuf)]
 struct Invitation {
@@ -142,6 +147,135 @@ where
         }
         Ok(())
     })
+}
+
+/// Runs a checked mesh host without child-side sandbox finalization.
+pub fn try_run_mesh_host_checked<U, F, T>(base_name: &str, f: F) -> anyhow::Result<()>
+where
+    U: 'static + MeshPayload + Send,
+    F: AsyncFnOnce(U) -> anyhow::Result<T>,
+{
+    try_run_mesh_host_checked_inner(base_name, None, f)
+}
+
+/// Runs a mesh host and applies `finalize` before accepting its initial message.
+///
+/// Use this with [`ProcessConfig::new_with_checked_sandbox`] when the sandbox
+/// requires child-side setup.
+pub fn try_run_mesh_host_with_finalize<U, F, T, C>(
+    base_name: &str,
+    finalize: C,
+    f: F,
+) -> anyhow::Result<()>
+where
+    U: 'static + MeshPayload + Send,
+    F: AsyncFnOnce(U) -> anyhow::Result<T>,
+    C: FnOnce(&InheritedResourceManifest) -> anyhow::Result<()> + 'static,
+{
+    try_run_mesh_host_checked_inner(base_name, Some(Box::new(finalize)), f)
+}
+
+/// Runs a checked mesh host using a child-local sandbox profile.
+pub fn try_run_mesh_host_with_profile<U, F, T, P>(
+    base_name: &str,
+    mut profile: P,
+    f: F,
+) -> anyhow::Result<()>
+where
+    U: 'static + MeshPayload + Send,
+    F: AsyncFnOnce(U) -> anyhow::Result<T>,
+    P: SandboxProfile + 'static,
+{
+    try_run_mesh_host_with_finalize(
+        base_name,
+        move |inherited_resources| profile.finalize_checked(inherited_resources),
+        f,
+    )
+}
+
+type ChildFinalize = Box<dyn FnOnce(&InheritedResourceManifest) -> anyhow::Result<()>>;
+
+fn try_run_mesh_host_checked_inner<U, F, T>(
+    base_name: &str,
+    finalize: Option<ChildFinalize>,
+    f: F,
+) -> anyhow::Result<()>
+where
+    U: 'static + MeshPayload + Send,
+    F: AsyncFnOnce(U) -> anyhow::Result<T>,
+{
+    let checked_startup = match checked_startup_from_environment()? {
+        Some(config) => config,
+        None => return Ok(()),
+    };
+    anyhow::ensure!(
+        checked_startup.protocol_version == HOST_PROTOCOL_VERSION,
+        "unsupported host protocol version {}",
+        checked_startup.protocol_version
+    );
+
+    let finalize_callback_completed = finalize.is_some();
+    if let Some(finalize) = finalize {
+        finalize(&checked_startup.inherited_resources)
+            .context("failed to finalize child sandbox")?;
+    }
+
+    block_on(async {
+        if let Some(r) = node_from_environment().await? {
+            let NodeResult {
+                node_name,
+                node,
+                initial_port,
+            } = r;
+            PROCESS_NAME.store(&node_name);
+            set_program_name(&format!("{base_name}-{node_name}"));
+            let bootstrap = OneshotReceiver::<BootstrapMessage>::from(initial_port)
+                .await
+                .context("failed to receive bootstrap message")?;
+            bootstrap.startup.send(StartupStatus::Ready {
+                protocol_version: HOST_PROTOCOL_VERSION,
+                finalize_callback_completed,
+            });
+
+            let init_message = OneshotReceiver::<U>::from(bootstrap.initial_message)
+                .await
+                .context("failed to receive initial message")?;
+            let _drop = (
+                f(init_message).map(Some),
+                handle_host_requests(bootstrap.requests).map(|()| None),
+            )
+                .race()
+                .await
+                .transpose()?;
+
+            tracing::debug!("waiting to shut down node");
+            node.shutdown().await;
+            drop(_drop);
+            std::process::exit(0);
+        }
+        Ok(())
+    })
+}
+
+fn checked_startup_from_environment() -> anyhow::Result<Option<CheckedStartupConfig>> {
+    let config = match std::env::var(CHECKED_STARTUP_ENV_NAME) {
+        Ok(config) => config,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error).context("failed to read checked startup configuration"),
+    };
+
+    // SAFETY: Mesh host entry points run before application threads start.
+    unsafe {
+        std::env::remove_var(CHECKED_STARTUP_ENV_NAME);
+    }
+
+    mesh::payload::decode(
+        &base64::engine::general_purpose::STANDARD
+            .decode(config)
+            .context("failed to base64 decode checked startup configuration")?,
+    )
+    .context("failed to decode checked startup configuration")
+    .map(Some)
 }
 
 async fn handle_host_requests(mut recv: mesh::Receiver<HostRequest>) {
@@ -279,20 +413,130 @@ pub struct Mesh {
     task: Task<()>,
 }
 
+/// A resource intentionally inherited by a checked mesh host.
+#[derive(Clone, Debug, Protobuf, PartialEq, Eq)]
+pub struct InheritedResource {
+    name: String,
+    target: InheritedResourceTarget,
+}
+
+impl InheritedResource {
+    /// Returns the resource's stable profile-defined name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the resource's child-side target.
+    pub fn target(&self) -> &InheritedResourceTarget {
+        &self.target
+    }
+}
+
+/// The child-side identifier for an inherited resource.
+#[derive(Clone, Debug, Protobuf, PartialEq, Eq)]
+pub enum InheritedResourceTarget {
+    /// Standard input.
+    StandardInput,
+    /// Standard output.
+    StandardOutput,
+    /// Standard error.
+    StandardError,
+    /// A Unix file descriptor number.
+    FileDescriptor(i32),
+    /// A Windows handle value.
+    Handle(usize),
+}
+
+/// Resources intentionally inherited by a checked mesh host.
+///
+/// Sandbox profiles must declare every resource they add to the process
+/// builder.
+#[derive(Clone, Debug, Default, Protobuf, PartialEq, Eq)]
+pub struct InheritedResourceManifest {
+    resources: Vec<InheritedResource>,
+}
+
+impl InheritedResourceManifest {
+    /// Declares an inherited resource.
+    pub fn declare(
+        &mut self,
+        name: impl Into<String>,
+        target: InheritedResourceTarget,
+    ) -> anyhow::Result<()> {
+        let name = name.into();
+        anyhow::ensure!(!name.is_empty(), "inherited resource name cannot be empty");
+        anyhow::ensure!(
+            !self.resources.iter().any(|resource| resource.name == name),
+            "inherited resource name '{name}' is already declared"
+        );
+        anyhow::ensure!(
+            !self
+                .resources
+                .iter()
+                .any(|resource| resource.target == target),
+            "inherited resource target {target:?} is already declared"
+        );
+        self.resources.push(InheritedResource { name, target });
+        Ok(())
+    }
+
+    /// Returns the declared inherited resources.
+    pub fn resources(&self) -> &[InheritedResource] {
+        &self.resources
+    }
+
+    /// Returns a declared resource by name.
+    pub fn get(&self, name: &str) -> Option<&InheritedResourceTarget> {
+        self.resources
+            .iter()
+            .find(|resource| resource.name == name)
+            .map(|resource| &resource.target)
+    }
+}
+
 /// Sandbox profile trait used for mesh hosts.
 pub trait SandboxProfile: Send {
     /// Apply executes in the parent context and configures any sandbox
     /// features that will be applied to the newly created process via
     /// the pal builder object.
-    fn apply(&mut self, builder: &mut ProcessBuilder<'_>);
+    fn apply(&mut self, _builder: &mut ProcessBuilder<'_>) {}
 
-    /// Finalize is intended to execute in the child process context after
-    /// application specific initialization is complete. It's optional as not
-    /// every sandbox profile will need to perform additional sandboxing.
-    /// In addition, the child will need to be aware enough to instantiate its
-    /// sandbox profile and invoke this method.
+    /// Prepares the process builder and declares inherited resources.
+    ///
+    /// The default preserves the legacy infallible [`Self::apply`] behavior.
+    fn prepare(
+        &mut self,
+        builder: &mut ProcessBuilder<'_>,
+        inherited_resources: &mut InheritedResourceManifest,
+    ) -> anyhow::Result<()> {
+        let _ = inherited_resources;
+        self.apply(builder);
+        Ok(())
+    }
+
+    /// Returns whether checked launch requires child-side finalization.
+    ///
+    /// The parent verifies the child's acknowledgement. This detects
+    /// misconfigured trusted workers, not a malicious worker.
+    fn requires_child_finalize(&self) -> bool {
+        false
+    }
+
+    /// Finalizes the sandbox in the child process.
+    ///
+    /// Existing profiles may call this from their child bootstrap. Checked
+    /// hosts should use [`try_run_mesh_host_with_finalize`] to acknowledge it.
     fn finalize(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Finalizes a checked sandbox with its inherited resource manifest.
+    fn finalize_checked(
+        &mut self,
+        inherited_resources: &InheritedResourceManifest,
+    ) -> anyhow::Result<()> {
+        let _ = inherited_resources;
+        self.finalize()
     }
 }
 
@@ -305,6 +549,8 @@ pub struct ProcessConfig {
     skip_worker_arg: bool,
     sandbox_profile: Option<Box<dyn SandboxProfile + Sync>>,
     env_vars: Vec<(OsString, OsString)>,
+    checked_startup: bool,
+    startup_timeout: Duration,
 }
 
 impl ProcessConfig {
@@ -319,6 +565,8 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: None,
             env_vars: Vec::new(),
+            checked_startup: false,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
         }
     }
 
@@ -336,6 +584,29 @@ impl ProcessConfig {
             skip_worker_arg: false,
             sandbox_profile: Some(sandbox_profile),
             env_vars: Vec::new(),
+            checked_startup: false,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+        }
+    }
+
+    /// Returns process configuration with checked sandbox startup.
+    ///
+    /// The launch waits for a compatible child readiness response and any
+    /// required child-side finalization before delivering the initial message.
+    pub fn new_with_checked_sandbox(
+        name: impl Into<String>,
+        sandbox_profile: Box<dyn SandboxProfile + Sync>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            process_name: None,
+            process_args: Vec::new(),
+            stderr: None,
+            skip_worker_arg: false,
+            sandbox_profile: Some(sandbox_profile),
+            env_vars: Vec::new(),
+            checked_startup: true,
+            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
         }
     }
 
@@ -381,11 +652,18 @@ impl ProcessConfig {
         self.stderr = file;
         self
     }
+
+    /// Sets the maximum time allowed for checked child startup.
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = timeout;
+        self
+    }
 }
 
 struct MeshInner {
     requests: mesh::Receiver<MeshRequest>,
     hosts: Slab<MeshHostInner>,
+    startups: FuturesUnordered<Task<StartupCompletion>>,
     /// Handles for spawned host processes.
     waiters: FuturesUnordered<Task<usize>>,
     /// Mesh node for host process communication.
@@ -409,6 +687,37 @@ struct MeshHostInner {
     send: mesh::Sender<HostRequest>,
 }
 
+#[cfg(windows)]
+type MeshChild = pal_async::windows::PolledProcess;
+#[cfg(unix)]
+type MeshChild = pal_async::process::PolledChild<pal::unix::process::Child>;
+
+struct StartingHost {
+    child: MeshChild,
+    name: String,
+    pid: i32,
+    node_id: mesh::NodeId,
+    request_send: mesh::Sender<HostRequest>,
+    checked_startup: Option<CheckedStartup>,
+    requires_child_finalize: bool,
+    startup_timeout: Duration,
+    #[cfg(windows)]
+    connection: mesh_remote::windows::AlpcInvitationHandle,
+}
+
+struct StartedHost {
+    child: MeshChild,
+    name: String,
+    pid: i32,
+    node_id: mesh::NodeId,
+    request_send: mesh::Sender<HostRequest>,
+}
+
+struct StartupCompletion {
+    rpc: FailableRpc<(), i32>,
+    result: anyhow::Result<StartedHost>,
+}
+
 enum MeshRequest {
     NewHost(FailableRpc<NewHostParams, i32>),
     Listen(FailableRpc<ListenParams, Task<()>>),
@@ -425,6 +734,12 @@ struct NewHostParams {
     config: ProcessConfig,
     recv: Port,
     request_send: mesh::Sender<HostRequest>,
+    checked_startup: Option<CheckedStartup>,
+}
+
+struct CheckedStartup {
+    startup: OneshotReceiver<StartupStatus>,
+    send_bootstrap: Box<dyn FnOnce() + Send>,
 }
 
 impl Mesh {
@@ -461,6 +776,7 @@ impl Mesh {
         let mut inner = MeshInner {
             requests,
             hosts: Default::default(),
+            startups: Default::default(),
             waiters: Default::default(),
             node,
             node_driver: node_driver.clone(),
@@ -494,24 +810,54 @@ impl Mesh {
         initial_message: T,
     ) -> anyhow::Result<i32> {
         let (request_send, request_recv) = mesh::channel();
+        let mut initial_message = Some(initial_message);
 
-        let (init_send, init_recv) = mesh::oneshot::<InitialMessage<T>>();
-        init_send.send(InitialMessage {
-            requests: request_recv,
-            init_message: initial_message,
-        });
+        let (recv, checked_startup, initial_send) = if config.checked_startup {
+            let (startup_send, startup_recv) = mesh::oneshot();
+            let (initial_send, initial_recv) = mesh::oneshot();
+            let (bootstrap_send, bootstrap_recv) = mesh::oneshot();
+            let send_bootstrap = Box::new(move || {
+                bootstrap_send.send(BootstrapMessage {
+                    requests: request_recv,
+                    startup: startup_send,
+                    initial_message: initial_recv.into(),
+                });
+            });
+            (
+                bootstrap_recv.into(),
+                Some(CheckedStartup {
+                    startup: startup_recv,
+                    send_bootstrap,
+                }),
+                Some(initial_send),
+            )
+        } else {
+            let (init_send, init_recv) = mesh::oneshot::<InitialMessage<T>>();
+            init_send.send(InitialMessage {
+                requests: request_recv,
+                init_message: initial_message.take().unwrap(),
+            });
+            (init_recv.into(), None, None)
+        };
 
-        self.request
+        let pid = self
+            .request
             .call_failable(
                 MeshRequest::NewHost,
                 NewHostParams {
                     config,
-                    recv: init_recv.into(),
+                    recv,
                     request_send,
+                    checked_startup,
                 },
             )
             .await
-            .context("failed to launch new host")
+            .context("failed to launch new host")?;
+
+        if let Some(initial_send) = initial_send {
+            initial_send.send(initial_message.take().unwrap());
+        }
+        Ok(pid)
     }
 
     /// Shutdown the mesh and wait for any spawned processes to exit.
@@ -636,10 +982,31 @@ impl Connection {
     }
 }
 
+#[derive(Debug, MeshPayload)]
+enum StartupStatus {
+    Ready {
+        protocol_version: u32,
+        finalize_callback_completed: bool,
+    },
+}
+
+#[derive(Protobuf)]
+struct CheckedStartupConfig {
+    protocol_version: u32,
+    inherited_resources: InheritedResourceManifest,
+}
+
 #[derive(MeshPayload)]
 struct InitialMessage<T> {
     requests: mesh::Receiver<HostRequest>,
     init_message: T,
+}
+
+#[derive(MeshPayload)]
+struct BootstrapMessage {
+    requests: mesh::Receiver<HostRequest>,
+    startup: OneshotSender<StartupStatus>,
+    initial_message: Port,
 }
 
 #[derive(Debug, MeshPayload)]
@@ -668,12 +1035,14 @@ impl MeshInner {
     async fn run(&mut self) {
         enum Event {
             Request(MeshRequest),
+            Startup(StartupCompletion),
             Done(usize),
         }
 
         loop {
             let event = futures::select! { // merge semantics
                 request = self.requests.select_next_some() => Event::Request(request),
+                startup = self.startups.select_next_some() => Event::Startup(startup),
                 n = self.waiters.select_next_some() => Event::Done(n),
                 complete => break,
             };
@@ -681,8 +1050,22 @@ impl MeshInner {
             match event {
                 Event::Request(request) => match request {
                     MeshRequest::NewHost(rpc) => {
-                        rpc.handle_failable(async |params| self.spawn_process(params).await)
-                            .await
+                        let (params, rpc) = rpc.split();
+                        match self.start_process(params).await {
+                            Ok(starting) => {
+                                let driver = self.node_driver.clone();
+                                self.startups.push(self.node_driver.spawn(
+                                    format!("start-mesh-child-{}", starting.pid),
+                                    async move {
+                                        StartupCompletion {
+                                            rpc,
+                                            result: starting.finish(&driver).await,
+                                        }
+                                    },
+                                ));
+                            }
+                            Err(error) => rpc.fail(error),
+                        }
                     }
                     MeshRequest::Listen(rpc) => {
                         rpc.handle_failable(async |params| self.start_listener(params))
@@ -749,11 +1132,42 @@ impl MeshInner {
                         }
                     }
                 },
+                Event::Startup(StartupCompletion { rpc, result }) => match result {
+                    Ok(started) => {
+                        let pid = started.pid;
+                        self.register_started_host(started);
+                        rpc.complete(Ok(pid));
+                    }
+                    Err(error) => rpc.fail(error),
+                },
                 Event::Done(id) => {
                     self.hosts.remove(id);
                 }
             }
         }
+    }
+
+    fn register_started_host(&mut self, started: StartedHost) {
+        let StartedHost {
+            child,
+            name,
+            pid,
+            node_id,
+            request_send,
+        } = started;
+        let id = self.hosts.insert(MeshHostInner {
+            name: name.clone(),
+            pid,
+            node_id,
+            send: request_send,
+        });
+        let task = self
+            .node_driver
+            .spawn(format!("wait-mesh-child-{pid}"), async move {
+                wait_mesh_child(child, &name, pid).await;
+                id
+            });
+        self.waiters.push(task);
     }
 
     fn start_listener(&self, params: ListenParams) -> anyhow::Result<Task<()>> {
@@ -815,15 +1229,27 @@ impl MeshInner {
 
     /// Spawns a new process with a mesh channel associated with this `Mesh` instance.
     #[instrument(name = "mesh_spawn_process", skip(self, params), fields(mesh_name = self.mesh_name.as_str(), pid = tracing::field::Empty))]
-    async fn spawn_process(&mut self, params: NewHostParams) -> anyhow::Result<i32> {
+    async fn start_process(&mut self, params: NewHostParams) -> anyhow::Result<StartingHost> {
         let NewHostParams {
             config,
             recv,
             request_send,
+            checked_startup,
         } = params;
 
         let pid;
         let node_id;
+        let mut inherited_resources = InheritedResourceManifest::default();
+        let mut requires_child_finalize = false;
+        let startup_timeout = config.startup_timeout;
+        let checked = checked_startup.is_some();
+        #[cfg(windows)]
+        let connection;
+        if checked {
+            inherited_resources.declare("stdin", InheritedResourceTarget::StandardInput)?;
+            inherited_resources.declare("stdout", InheritedResourceTarget::StandardOutput)?;
+            inherited_resources.declare("stderr", InheritedResourceTarget::StandardError)?;
+        }
 
         // If no process name was passed, use the current executable path to
         // ensure we get the right file, but set arg0 to match how this process
@@ -841,9 +1267,17 @@ impl MeshInner {
 
         #[cfg(windows)]
         let child = {
-            let (invitation, handle) = self.node.invite(recv).context("mesh node invite error")?;
+            let (invitation, invitation_connection) =
+                self.node.invite(recv).context("mesh node invite error")?;
+            connection = invitation_connection;
             node_id = invitation.node_id();
             let (credentials, directory) = invitation.into_parts();
+            if checked {
+                inherited_resources.declare(
+                    "mesh-ipc",
+                    InheritedResourceTarget::Handle(directory.as_raw_handle() as usize),
+                )?;
+            }
 
             let invitation_env = base64::engine::general_purpose::STANDARD.encode(
                 mesh::payload::encode(Invitation {
@@ -879,20 +1313,32 @@ impl MeshInner {
             }
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut builder);
+                requires_child_finalize = sandbox_profile.requires_child_finalize();
+                anyhow::ensure!(
+                    checked || !requires_child_finalize,
+                    "sandbox profile requires checked child finalization"
+                );
+                sandbox_profile
+                    .prepare(&mut builder, &mut inherited_resources)
+                    .context("failed to prepare sandbox profile")?;
+            }
+            if checked {
+                builder.env(
+                    CHECKED_STARTUP_ENV_NAME,
+                    encode_checked_startup(&inherited_resources),
+                );
             }
 
             // Launch the child process on a separate thread to isolate
             // the CreateProcess call from other IO pools.
             let child = std::thread::scope(|s| s.spawn(|| builder.spawn()).join().unwrap())
                 .context("failed to launch mesh process")?;
-            // Wait for the child to connect to the mesh. TODO: timeout
-            handle.await;
-            pid = child.id() as i32;
+            let child = pal_async::windows::PolledProcess::new(&self.node_driver, child)
+                .expect("failed to create process wait");
+            pid = child.get().id() as i32;
             tracing::Span::current().record("pid", pid);
 
-            pal_async::windows::PolledProcess::new(&self.node_driver, child)
-                .expect("failed to create process wait")
+            child
         };
         #[cfg(unix)]
         let child = {
@@ -905,6 +1351,10 @@ impl MeshInner {
                 .context("mesh node invite error")?;
 
             node_id = invitation.address.local_addr.node;
+            if checked {
+                inherited_resources
+                    .declare("mesh-ipc", InheritedResourceTarget::FileDescriptor(IPC_FD))?;
+            }
 
             let invitation_env = base64::engine::general_purpose::STANDARD.encode(
                 mesh::payload::encode(Invitation {
@@ -938,7 +1388,20 @@ impl MeshInner {
             }
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut command);
+                requires_child_finalize = sandbox_profile.requires_child_finalize();
+                anyhow::ensure!(
+                    checked || !requires_child_finalize,
+                    "sandbox profile requires checked child finalization"
+                );
+                sandbox_profile
+                    .prepare(&mut command, &mut inherited_resources)
+                    .context("failed to prepare sandbox profile")?;
+            }
+            if checked {
+                command.env(
+                    CHECKED_STARTUP_ENV_NAME,
+                    encode_checked_startup(&inherited_resources),
+                );
             }
 
             // Launch the child process on a separate thread to isolate
@@ -952,23 +1415,177 @@ impl MeshInner {
                 .expect("failed to create process wait")
         };
 
-        let id = self.hosts.insert(MeshHostInner {
-            name: config.name,
+        Ok(StartingHost {
+            child,
+            name,
             pid,
             node_id,
-            send: request_send,
-        });
-
-        let task = self
-            .node_driver
-            .spawn(format!("wait-mesh-child-{}", pid), async move {
-                wait_mesh_child(child, &name, pid).await;
-                id
-            });
-
-        self.waiters.push(task);
-        Ok(pid)
+            request_send,
+            checked_startup,
+            requires_child_finalize,
+            startup_timeout,
+            #[cfg(windows)]
+            connection,
+        })
     }
+}
+
+impl StartingHost {
+    async fn finish(mut self, driver: &IpcNodeDriver) -> anyhow::Result<StartedHost> {
+        #[cfg(windows)]
+        if self.checked_startup.is_none() {
+            self.connection.await;
+        }
+
+        if let Some(CheckedStartup {
+            startup,
+            send_bootstrap,
+        }) = self.checked_startup
+        {
+            send_bootstrap();
+            let startup_result =
+                wait_for_startup(driver, &mut self.child, startup, self.startup_timeout)
+                    .await
+                    .and_then(|status| match status {
+                        StartupStatus::Ready {
+                            protocol_version,
+                            finalize_callback_completed,
+                        } => {
+                            anyhow::ensure!(
+                                protocol_version == HOST_PROTOCOL_VERSION,
+                                "mesh host protocol mismatch: expected {HOST_PROTOCOL_VERSION}, got {protocol_version}"
+                            );
+                            anyhow::ensure!(
+                                !self.requires_child_finalize || finalize_callback_completed,
+                                "mesh host did not complete required child sandbox finalization"
+                            );
+                            Ok(())
+                        }
+                    });
+
+            if let Err(startup_error) = startup_result {
+                if let Err(cleanup_error) = terminate_starting_child(&mut self.child).await {
+                    return Err(startup_error.context(format!(
+                        "failed to terminate mesh child after startup failure: {cleanup_error:#}"
+                    )));
+                }
+                return Err(startup_error);
+            }
+        }
+
+        Ok(StartedHost {
+            child: self.child,
+            name: self.name,
+            pid: self.pid,
+            node_id: self.node_id,
+            request_send: self.request_send,
+        })
+    }
+}
+
+fn encode_checked_startup(inherited_resources: &InheritedResourceManifest) -> String {
+    base64::engine::general_purpose::STANDARD.encode(mesh::payload::encode(CheckedStartupConfig {
+        protocol_version: HOST_PROTOCOL_VERSION,
+        inherited_resources: inherited_resources.clone(),
+    }))
+}
+
+enum StartupWait {
+    Status(anyhow::Result<StartupStatus>),
+    Timeout,
+    Exited(anyhow::Result<String>),
+}
+
+#[cfg(windows)]
+async fn wait_for_startup(
+    driver: &IpcNodeDriver,
+    child: &mut MeshChild,
+    startup: OneshotReceiver<StartupStatus>,
+    timeout: Duration,
+) -> anyhow::Result<StartupStatus> {
+    let mut timer = pal_async::timer::PolledTimer::new(driver);
+    let startup = startup
+        .map(|result| StartupWait::Status(result.context("mesh child closed the startup channel")));
+    let timeout = timer.sleep(timeout).map(|_| StartupWait::Timeout);
+    let exited = child.wait().map(|result| {
+        StartupWait::Exited(
+            result
+                .map(|code| format!("exit code {code}"))
+                .context("failed to wait for mesh child during startup"),
+        )
+    });
+    match (startup, timeout, exited).race().await {
+        StartupWait::Status(Ok(status)) => Ok(status),
+        StartupWait::Status(Err(channel_error)) => {
+            Err(channel_error).context("mesh child closed startup channel before readiness")
+        }
+        StartupWait::Timeout => anyhow::bail!("mesh child startup timed out"),
+        StartupWait::Exited(status) => {
+            anyhow::bail!("mesh child exited before startup readiness: {}", status?)
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_startup(
+    driver: &IpcNodeDriver,
+    child: &mut MeshChild,
+    startup: OneshotReceiver<StartupStatus>,
+    timeout: Duration,
+) -> anyhow::Result<StartupStatus> {
+    let mut timer = pal_async::timer::PolledTimer::new(driver);
+    let startup = startup
+        .map(|result| StartupWait::Status(result.context("mesh child closed the startup channel")));
+    let timeout = timer.sleep(timeout).map(|_| StartupWait::Timeout);
+    let exited = child.wait().map(|result| {
+        StartupWait::Exited(
+            result
+                .map(|status| status.to_string())
+                .context("failed to wait for mesh child during startup"),
+        )
+    });
+    match (startup, timeout, exited).race().await {
+        StartupWait::Status(Ok(status)) => Ok(status),
+        StartupWait::Status(Err(channel_error)) => {
+            Err(channel_error).context("mesh child closed startup channel before readiness")
+        }
+        StartupWait::Timeout => anyhow::bail!("mesh child startup timed out"),
+        StartupWait::Exited(status) => {
+            anyhow::bail!("mesh child exited before startup readiness: {}", status?)
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn terminate_starting_child(
+    child: &mut pal_async::windows::PolledProcess,
+) -> anyhow::Result<()> {
+    if let Err(error) = child.get().kill(1) {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if error.raw_os_error() != Some(ERROR_ACCESS_DENIED) {
+            return Err(error).context("failed to terminate mesh child");
+        }
+    }
+    child
+        .wait()
+        .await
+        .context("failed to wait for terminated mesh child")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn terminate_starting_child(
+    child: &mut pal_async::process::PolledChild<pal::unix::process::Child>,
+) -> anyhow::Result<()> {
+    child
+        .get_mut()
+        .kill()
+        .context("failed to terminate mesh child")?;
+    child
+        .wait()
+        .await
+        .context("failed to wait for terminated mesh child")?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1021,7 +1638,327 @@ mod tests {
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::task::Spawn;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use test_with_tracing::test;
+
+    struct TestProfile {
+        fail_prepare: bool,
+        requires_finalize: bool,
+    }
+
+    #[derive(MeshPayload)]
+    struct TestMessage {
+        value: u32,
+    }
+
+    impl SandboxProfile for TestProfile {
+        fn prepare(
+            &mut self,
+            _builder: &mut ProcessBuilder<'_>,
+            _inherited_resources: &mut InheritedResourceManifest,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.fail_prepare, "test profile preparation failed");
+            Ok(())
+        }
+
+        fn requires_child_finalize(&self) -> bool {
+            self.requires_finalize
+        }
+    }
+
+    fn checked_config(child_test: &str, profile: TestProfile) -> ProcessConfig {
+        ProcessConfig::new_with_checked_sandbox("checked", Box::new(profile))
+            .process_name(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", child_test, "--nocapture"])
+            .skip_worker_arg(true)
+            .startup_timeout(Duration::from_secs(10))
+    }
+
+    #[test]
+    #[ignore]
+    fn checked_child() {
+        try_run_mesh_host_checked("mesh-process-test", |message: TestMessage| async move {
+            anyhow::ensure!(message.value == 42, "unexpected initial value");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn finalized_child() {
+        static FINALIZED: AtomicBool = AtomicBool::new(false);
+        try_run_mesh_host_with_finalize(
+            "mesh-process-test",
+            |resources| {
+                #[cfg(unix)]
+                anyhow::ensure!(
+                    resources.get("mesh-ipc")
+                        == Some(&InheritedResourceTarget::FileDescriptor(IPC_FD)),
+                    "mesh IPC descriptor is missing from inherited resource manifest"
+                );
+                #[cfg(windows)]
+                anyhow::ensure!(
+                    matches!(
+                        resources.get("mesh-ipc"),
+                        Some(InheritedResourceTarget::Handle(_))
+                    ),
+                    "mesh IPC handle is missing from inherited resource manifest"
+                );
+                FINALIZED.store(true, Ordering::Release);
+                Ok(())
+            },
+            |message: TestMessage| async move {
+                anyhow::ensure!(FINALIZED.load(Ordering::Acquire), "sandbox not finalized");
+                anyhow::ensure!(message.value == 42, "unexpected initial value");
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn wrong_version_child() {
+        block_on(async {
+            if let Some(node) = node_from_environment().await.unwrap() {
+                let bootstrap = OneshotReceiver::<BootstrapMessage>::from(node.initial_port)
+                    .await
+                    .unwrap();
+                bootstrap.startup.send(StartupStatus::Ready {
+                    protocol_version: HOST_PROTOCOL_VERSION + 1,
+                    finalize_callback_completed: false,
+                });
+                std::future::pending::<()>().await;
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn stalled_child() {
+        if checked_startup_from_environment().unwrap().is_some() {
+            block_on(std::future::pending::<()>());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn exited_child() {
+        if checked_startup_from_environment().unwrap().is_some() {
+            std::process::exit(7);
+        }
+    }
+
+    #[async_test]
+    async fn test_checked_launch() {
+        let mesh = Mesh::new("checked-launch".to_string()).unwrap();
+        let pid = mesh
+            .launch_host(
+                checked_config(
+                    "tests::finalized_child",
+                    TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: true,
+                    },
+                ),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap();
+        assert_ne!(pid, 0);
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_launch_requires_finalize() {
+        let mesh = Mesh::new("checked-finalize".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                checked_config(
+                    "tests::checked_child",
+                    TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: true,
+                    },
+                ),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not complete required child sandbox finalization")
+        );
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_launch_rejects_protocol_mismatch() {
+        let mesh = Mesh::new("checked-version".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                checked_config(
+                    "tests::wrong_version_child",
+                    TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: false,
+                    },
+                ),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("mesh host protocol mismatch"));
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_launch_reports_prepare_failure() {
+        let mesh = Mesh::new("checked-prepare".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                checked_config(
+                    "tests::checked_child",
+                    TestProfile {
+                        fail_prepare: true,
+                        requires_finalize: false,
+                    },
+                ),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("test profile preparation failed"));
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_launch_times_out() {
+        let mesh = Mesh::new("checked-timeout".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                checked_config(
+                    "tests::stalled_child",
+                    TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: false,
+                    },
+                )
+                .startup_timeout(Duration::from_millis(50)),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("startup timed out"));
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_launch_reports_early_exit() {
+        let mesh = Mesh::new("checked-exit".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                checked_config(
+                    "tests::exited_child",
+                    TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: false,
+                    },
+                ),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("exited before startup readiness")
+                || error.contains("closed startup channel before readiness")
+        );
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_checked_startup_does_not_block_mesh(driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("mesh-responsive.sock");
+        let mesh = Mesh::new("checked-responsive".to_string()).unwrap();
+        {
+            let mut launch = std::pin::pin!(
+                mesh.launch_host(
+                    checked_config(
+                        "tests::stalled_child",
+                        TestProfile {
+                            fail_prepare: false,
+                            requires_finalize: false,
+                        },
+                    )
+                    .startup_timeout(Duration::from_millis(200)),
+                    TestMessage { value: 42 },
+                )
+                .fuse()
+            );
+            let mut listen = std::pin::pin!(mesh.listen::<String>(&sock_path).fuse());
+
+            let mut timer = pal_async::timer::PolledTimer::new(&driver);
+            let mut timeout = std::pin::pin!(timer.sleep(Duration::from_millis(100)).fuse());
+            futures::select! {
+                result = listen => {
+                    drop(result.unwrap());
+                }
+                _ = timeout => panic!("mesh control loop blocked during checked startup"),
+                result = launch => panic!("checked launch completed unexpectedly: {result:?}"),
+            }
+            assert!(launch.await.is_err());
+        }
+        mesh.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_unchecked_launch_rejects_required_finalize() {
+        let mesh = Mesh::new("unchecked-finalize".to_string()).unwrap();
+        let error = mesh
+            .launch_host(
+                ProcessConfig::new_with_sandbox(
+                    "unchecked",
+                    Box::new(TestProfile {
+                        fail_prepare: false,
+                        requires_finalize: true,
+                    }),
+                )
+                .process_name(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "tests::checked_child",
+                    "--nocapture",
+                ])
+                .skip_worker_arg(true),
+                TestMessage { value: 42 },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("requires checked child finalization"));
+        mesh.shutdown().await;
+    }
+
+    #[test]
+    fn inherited_resource_manifest_rejects_duplicates() {
+        let mut manifest = InheritedResourceManifest::default();
+        manifest
+            .declare("first", InheritedResourceTarget::FileDescriptor(4))
+            .unwrap();
+        assert!(
+            manifest
+                .declare("first", InheritedResourceTarget::FileDescriptor(5))
+                .is_err()
+        );
+        assert!(
+            manifest
+                .declare("second", InheritedResourceTarget::FileDescriptor(4))
+                .is_err()
+        );
+    }
 
     #[async_test]
     async fn test_listen(driver: DefaultDriver) {

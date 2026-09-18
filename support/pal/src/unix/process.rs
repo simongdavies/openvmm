@@ -479,6 +479,22 @@ impl Child {
     pub fn id(&self) -> i32 {
         self.pid
     }
+
+    /// Terminates the child process immediately.
+    pub fn kill(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+
+        // SAFETY: an unreaped child PID cannot be reused.
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Terminates the process immediately.
