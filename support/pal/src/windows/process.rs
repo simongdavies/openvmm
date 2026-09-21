@@ -4,6 +4,8 @@
 use super::BorrowedHandleExt;
 use super::Process;
 use super::job::Job;
+use super::security::MaximumSid;
+use super::security::Sid;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -16,6 +18,7 @@ use widestring::U16CString;
 use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
 use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
@@ -36,6 +39,7 @@ use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
 
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: u32 = 0x00020002;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: u32 = 0x000020007;
+const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: u32 = 0x00020009;
 const PROC_THREAD_ATTRIBUTE_JOB_LIST: u32 = 0x0002000d;
 const PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY: u32 = 0x00002000e;
 const PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY: u32 = 0x00002000f;
@@ -606,19 +610,35 @@ impl Stdio<'_> {
 }
 
 #[derive(Debug)]
+enum JobHandle<'a> {
+    Borrowed(BorrowedHandle<'a>),
+    Owned(OwnedHandle),
+}
+
+impl AsHandle for JobHandle<'_> {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        match self {
+            Self::Borrowed(handle) => handle.as_handle(),
+            Self::Owned(handle) => handle.as_handle(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Builder<'a> {
     creation_flags: u32,
     command_line: Vec<u16>,
     application_name: Option<Vec<u16>>,
     current_directory: Option<Vec<u16>>,
     handles: Vec<BorrowedHandle<'a>>,
-    jobs: Vec<BorrowedHandle<'a>>,
+    jobs: Vec<JobHandle<'a>>,
     stdin: Stdio<'a>,
     stdout: Stdio<'a>,
     stderr: Stdio<'a>,
     env: BTreeMap<OsString, Option<OsString>>,
     clear_env: bool,
     token: Option<BorrowedHandle<'a>>,
+    app_container: Option<MaximumSid>,
     disable_all_application_packages: bool,
     mitigation_policy: Option<MitigationPolicy>,
     child_process_policy: ChildProcessPolicy,
@@ -721,6 +741,7 @@ impl<'a> Builder<'a> {
             env: BTreeMap::new(),
             clear_env: false,
             token: None,
+            app_container: None,
             disable_all_application_packages: false,
             mitigation_policy: None,
             child_process_policy: ChildProcessPolicy::Allow,
@@ -729,6 +750,15 @@ impl<'a> Builder<'a> {
 
     pub fn application_name(&mut self, path: impl AsRef<OsStr>) -> &mut Self {
         self.application_name = Some(wstr(path.as_ref()));
+        self
+    }
+
+    /// Sets an owned working directory for the child instead of inheriting it.
+    ///
+    /// Sandboxed callers should select a trusted, accessible directory rather
+    /// than exposing the parent's working directory to the child.
+    pub fn current_directory(&mut self, path: impl AsRef<OsStr>) -> &mut Self {
+        self.current_directory = Some(wstr(path.as_ref()));
         self
     }
 
@@ -789,6 +819,16 @@ impl<'a> Builder<'a> {
         self
     }
 
+    /// Sets whether the child inherits the parent's environment (default: true).
+    ///
+    /// Unlike [`Self::env_clear`], this preserves explicit `env` and `env_remove`
+    /// entries. When inheritance is disabled, only explicit entries populate
+    /// the child's environment.
+    pub fn inherit_env(&mut self, inherit: bool) -> &mut Self {
+        self.clear_env = !inherit;
+        self
+    }
+
     /// Set the token to launch the process with.
     pub fn token(&mut self, token: BorrowedHandle<'a>) -> &mut Self {
         self.token = Some(token);
@@ -797,8 +837,37 @@ impl<'a> Builder<'a> {
 
     /// Add a job to the initial job list.
     pub fn job(&mut self, job: BorrowedHandle<'a>) -> &mut Self {
-        self.jobs.push(job);
+        self.jobs.push(JobHandle::Borrowed(job));
         self
+    }
+
+    /// Adds an owned job handle to the initial job list.
+    ///
+    /// Like [`Self::job`], this attaches the process during creation, before
+    /// any child code can run. Jobs retain the order in which they were added.
+    /// The builder retains this handle until creation completes. Keep another
+    /// handle alive if the job is configured to terminate on its last close.
+    pub fn owned_job(&mut self, job: OwnedHandle) -> &mut Self {
+        self.jobs.push(JobHandle::Owned(job));
+        self
+    }
+
+    /// Creates the process in the specified AppContainer, with no capabilities.
+    ///
+    /// Copies the SID so the caller need not keep it alive until [`Self::spawn`].
+    /// This uses the supported process security-capabilities attribute; it does
+    /// not create a profile or grant the container access to any objects.
+    /// The caller must supply a unique AppContainer SID and provision access to
+    /// the executable and any required resources separately. The corresponding
+    /// AppContainer profile must already have been provisioned by the caller.
+    pub fn app_container(&mut self, sid: &Sid) -> &mut Self {
+        self.app_container = Some(MaximumSid::from(sid));
+        self
+    }
+
+    /// Returns the AppContainer SID configured for process creation, if any.
+    pub fn app_container_sid(&self) -> Option<&Sid> {
+        self.app_container.as_ref().map(AsRef::as_ref)
     }
 
     /// When running as an AppContainer, disable the ALL APPLICATION PACKAGES
@@ -835,7 +904,7 @@ impl<'a> Builder<'a> {
     /// Spawns the process.
     pub fn spawn(mut self) -> io::Result<Process> {
         unsafe {
-            let mut list = AttrList::new(5);
+            let mut list = AttrList::new(6);
 
             let stdin = self.stdin.eval(STD_INPUT_HANDLE)?;
             let stdout = self.stdout.eval(STD_OUTPUT_HANDLE)?;
@@ -866,8 +935,22 @@ impl<'a> Builder<'a> {
                 self.handles.as_slice(),
             )?;
 
-            if !self.jobs.is_empty() {
-                list.update(0, PROC_THREAD_ATTRIBUTE_JOB_LIST, self.jobs.as_slice())?;
+            let jobs: Vec<_> = self.jobs.iter().map(AsHandle::as_handle).collect();
+            if !jobs.is_empty() {
+                list.update(0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs.as_slice())?;
+            }
+
+            let security_capabilities =
+                self.app_container
+                    .as_ref()
+                    .map(|sid| SECURITY_CAPABILITIES {
+                        AppContainerSid: sid.as_ptr(),
+                        Capabilities: null_mut(),
+                        CapabilityCount: 0,
+                        Reserved: 0,
+                    });
+            if let Some(capabilities) = &security_capabilities {
+                list.update(0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, capabilities)?;
             }
 
             if self.disable_all_application_packages {
@@ -909,7 +992,7 @@ impl<'a> Builder<'a> {
             // Construct an environment block if is different from the current
             // one.
             let mut env_block = None;
-            if !self.env.is_empty() {
+            if self.clear_env || !self.env.is_empty() {
                 let mut env: BTreeMap<OsString, OsString> = BTreeMap::new();
                 if !self.clear_env {
                     env = std::env::vars_os().collect();
@@ -931,6 +1014,9 @@ impl<'a> Builder<'a> {
                     block.push('=' as u16);
                     ensure_no_null(&val)?;
                     block.extend(val.encode_wide());
+                    block.push(0);
+                }
+                if block.is_empty() {
                     block.push(0);
                 }
                 block.push(0);
@@ -1017,8 +1103,27 @@ pub(crate) fn terminate(exit_code: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use super::Builder;
+    use super::ChildProcessPolicy;
     use super::EmptyProcess;
+    use super::MitigationPolicy;
+    use super::Stdio;
     use super::empty_process;
+    use crate::windows::job::Job;
+    use crate::windows::security::MaximumSid;
+    use crate::windows::security::Sid;
+    use std::os::windows::prelude::*;
+    use test_with_tracing::test;
+    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::Security::GetTokenInformation;
+    use windows_sys::Win32::Security::TOKEN_APPCONTAINER_INFORMATION;
+    use windows_sys::Win32::Security::TOKEN_GROUPS;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::Security::TokenAppContainerSid;
+    use windows_sys::Win32::Security::TokenCapabilities;
+    use windows_sys::Win32::Security::TokenIsAppContainer;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     #[test]
     fn test_empty() {
@@ -1026,5 +1131,213 @@ mod tests {
         drop(job);
         process.wait();
         assert_eq!(process.exit_code(), 0);
+    }
+
+    #[test]
+    fn initial_owned_and_borrowed_jobs() {
+        let parent_job = Job::new().unwrap();
+        parent_job.set_terminate_on_close().unwrap();
+        let child_job = Job::new().unwrap();
+        child_job.set_terminate_on_close().unwrap();
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let mut builder = Builder::from_args(executable, ["/c", "exit", "0"]);
+        builder
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .job(parent_job.as_handle())
+            .owned_job(child_job.as_handle().try_clone_to_owned().unwrap())
+            .mitigation_policy(MitigationPolicy::default())
+            .child_process_policy(ChildProcessPolicy::Disallow)
+            .suspended(true);
+        let process = builder.spawn().unwrap();
+        // SAFETY: The process and both job handles remain live for the queries.
+        unsafe {
+            for job in [&parent_job, &child_job] {
+                let mut member = 0;
+                assert_ne!(
+                    IsProcessInJob(
+                        process.as_handle().as_raw_handle(),
+                        job.as_handle().as_raw_handle(),
+                        &mut member,
+                    ),
+                    0
+                );
+                assert_ne!(member, 0);
+            }
+        }
+        drop(child_job);
+        process.wait();
+    }
+
+    #[test]
+    fn app_container_sid_is_owned() {
+        let mut builder = Builder::new("unused");
+        assert!(builder.app_container_sid().is_none());
+        let expected_sid = {
+            let mut sub_authorities = [0u32; 8];
+            sub_authorities[0] = 2;
+            for value in &mut sub_authorities[1..] {
+                let mut bytes = [0; 4];
+                getrandom::fill(&mut bytes).unwrap();
+                *value = u32::from_ne_bytes(bytes);
+            }
+            let sid = Sid::new([0, 0, 0, 0, 0, 15], sub_authorities);
+            builder.app_container(sid.as_ref());
+            MaximumSid::from(sid.as_ref())
+        };
+        assert_eq!(
+            builder.app_container_sid().unwrap().to_string_sid(),
+            expected_sid.to_string_sid()
+        );
+    }
+
+    #[test]
+    fn owned_current_directory() {
+        struct RemoveDirectory(std::path::PathBuf);
+        impl Drop for RemoveDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).unwrap();
+        let staged_directory = std::env::current_dir()
+            .unwrap()
+            .join(format!(".pal-cwd-{:016x}", u64::from_ne_bytes(random)));
+        std::fs::create_dir(&staged_directory).unwrap();
+        let cleanup = RemoveDirectory(staged_directory.clone());
+        let job = Job::new().unwrap();
+        job.set_terminate_on_close().unwrap();
+        let system_directory =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+        let command = format!(
+            "if /I \"%CD%\"==\"{}\" (exit /b 73) else (exit /b 74)",
+            staged_directory.display()
+        );
+        let mut builder =
+            Builder::from_args(system_directory.join("cmd.exe"), ["/d", "/c", &command]);
+        builder
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .job(job.as_handle())
+            .current_directory(&staged_directory);
+        let path = staged_directory.clone();
+        drop(staged_directory);
+        let process = builder.spawn().unwrap();
+        process.wait();
+        assert_eq!(process.exit_code(), 73);
+        drop(cleanup);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn missing_current_directory_prevents_spawn() {
+        let job = Job::new().unwrap();
+        job.set_terminate_on_close().unwrap();
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).unwrap();
+        let missing_directory = std::env::current_dir().unwrap().join(format!(
+            ".pal-missing-cwd-{:016x}",
+            u64::from_ne_bytes(random)
+        ));
+        assert!(!missing_directory.exists());
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let mut builder = Builder::from_args(executable, ["/d", "/c", "exit", "0"]);
+        builder
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .job(job.as_handle())
+            .current_directory(missing_directory);
+        let error = builder.spawn().unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_DIRECTORY as i32)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a provisioned unique PAL_TEST_APPCONTAINER_SID with executable access"]
+    fn app_container_token_has_no_capabilities() {
+        let expected_sid: MaximumSid = std::env::var("PAL_TEST_APPCONTAINER_SID")
+            .expect("set PAL_TEST_APPCONTAINER_SID to a provisioned unique AppContainer SID")
+            .parse()
+            .unwrap();
+        let job = Job::new().unwrap();
+        job.set_terminate_on_close().unwrap();
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let mut builder = Builder::from_args(executable, ["/c", "exit", "0"]);
+        builder
+            .stdin(Stdio::Null)
+            .stdout(Stdio::Null)
+            .stderr(Stdio::Null)
+            .owned_job(job.as_handle().try_clone_to_owned().unwrap())
+            .app_container(expected_sid.as_ref())
+            .disable_all_application_packages(true)
+            .mitigation_policy(MitigationPolicy::default())
+            .child_process_policy(ChildProcessPolicy::Disallow)
+            .suspended(true);
+        builder.current_directory(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"),
+        );
+        let process = builder.spawn().unwrap();
+        // SAFETY: All handles and buffers remain live throughout these queries.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(process.as_handle().as_raw_handle(), TOKEN_QUERY, &mut token),
+                0
+            );
+            let token = OwnedHandle::from_raw_handle(token);
+            let mut returned = 0;
+            let mut is_app_container = 0u32;
+            assert_ne!(
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenIsAppContainer,
+                    std::ptr::from_mut(&mut is_app_container).cast(),
+                    size_of_val(&is_app_container) as u32,
+                    &mut returned,
+                ),
+                0
+            );
+            assert_eq!(is_app_container, 1);
+            let mut buffer = [0usize; 32];
+            assert_ne!(
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenAppContainerSid,
+                    buffer.as_mut_ptr().cast(),
+                    size_of_val(&buffer) as u32,
+                    &mut returned,
+                ),
+                0
+            );
+            let info = &*buffer.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>();
+            assert_ne!(EqualSid(info.TokenAppContainer, expected_sid.as_ptr()), 0);
+            assert_ne!(
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenCapabilities,
+                    buffer.as_mut_ptr().cast(),
+                    size_of_val(&buffer) as u32,
+                    &mut returned,
+                ),
+                0
+            );
+            let groups = &*buffer.as_ptr().cast::<TOKEN_GROUPS>();
+            assert_eq!(groups.GroupCount, 0);
+        }
+        drop(job);
+        process.wait();
     }
 }

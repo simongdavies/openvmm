@@ -239,6 +239,39 @@ impl Clone for WaitObject {
 pub struct Process(WaitObject);
 
 impl Process {
+    /// Returns the exit code only after the process handle is signalled.
+    pub fn try_wait(&self) -> Result<Option<u32>> {
+        self.wait_timeout(0)
+    }
+
+    /// Waits for actual process exit, propagating wait and status-query errors.
+    pub fn wait_for_exit(&self) -> Result<u32> {
+        self.wait_timeout(INFINITE)?
+            .ok_or_else(|| Error::other("infinite process wait unexpectedly timed out"))
+    }
+
+    fn wait_timeout(&self, milliseconds: u32) -> Result<Option<u32>> {
+        // SAFETY: the process handle remains owned throughout the wait.
+        let result = unsafe {
+            windows_sys::Win32::System::Threading::WaitForSingleObject(
+                self.as_handle().as_raw_handle(),
+                milliseconds,
+            )
+        };
+        match result {
+            0 => {
+                let mut code = 0;
+                // SAFETY: querying the retained process handle after exit.
+                if unsafe { GetExitCodeProcess(self.as_handle().as_raw_handle(), &mut code) } == 0 {
+                    return Err(Error::last_os_error());
+                }
+                Ok(Some(code))
+            }
+            windows_sys::Win32::Foundation::WAIT_TIMEOUT => Ok(None),
+            _ => Err(Error::last_os_error()),
+        }
+    }
+
     pub fn wait(&self) {
         self.0.wait()
     }

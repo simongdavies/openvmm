@@ -19,6 +19,8 @@ use std::io;
 use std::os::unix::prelude::*;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use caps::CapsHashSet;
@@ -58,6 +60,8 @@ pub struct LinuxBuilder<'a> {
     inheritable_capabilities: Option<CapsHashSet>,
     landlock_rules: Option<RulesetCreated>,
     seccomp_filter: Option<SeccompFilter>,
+    cgroup_procs: Option<Arc<OwnedFd>>,
+    close_fds: bool,
 }
 
 /// A builder for a child process.
@@ -127,6 +131,12 @@ fn c_slice_to_pointers(s: &[CString]) -> Vec<*const libc::c_char> {
         .map(|x| x.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect()
+}
+
+struct PreparedSpawn {
+    envp: Vec<CString>,
+    fd_ops: Vec<(i32, FdOp)>,
+    _null_file: Option<std::fs::File>,
 }
 
 impl<'a> Builder<'a> {
@@ -203,6 +213,16 @@ impl<'a> Builder<'a> {
         self
     }
 
+    /// Sets whether the child inherits the parent's environment (default: true).
+    ///
+    /// Unlike [`Self::env_clear`], this preserves explicit `env` and `env_remove`
+    /// entries. When inheritance is disabled, only explicit entries populate
+    /// the child's environment.
+    pub fn inherit_env(&mut self, inherit: bool) -> &mut Self {
+        self.clear_env = !inherit;
+        self
+    }
+
     /// Sets the policy for stdin.
     pub fn stdin(&mut self, stdin: Stdio<'a>) -> &mut Self {
         self.stdin = stdin;
@@ -266,6 +286,43 @@ impl<'a> Builder<'a> {
     #[cfg(target_os = "linux")]
     pub fn vfork(&mut self) -> bool {
         self.linux_builder.vfork
+    }
+
+    /// Enrolls the child through a preopened `cgroup.procs` before any exec.
+    ///
+    /// The caller must open and validate the intended delegated cgroup and
+    /// configure its budgets before launch. The child writes ASCII `0` (itself)
+    /// before descriptor mappings or sandbox changes, then closes its inherited
+    /// copy. The builder retains the parent's descriptor through an `Arc`.
+    ///
+    /// Enrollment errors are always fatal, regardless of the sandbox failure
+    /// mode. This requires vfork and an independent child descriptor table so
+    /// that startup errors can be reported by `spawn`. Mapping this descriptor
+    /// into the workload is rejected. This is not atomic clone-time placement:
+    /// the trusted clone trampoline runs before enrollment. Domain ownership
+    /// and cleanup remain the caller's responsibility.
+    #[cfg(target_os = "linux")]
+    pub fn set_cgroup_procs(&mut self, cgroup_procs: Arc<OwnedFd>) -> &mut Self {
+        self.linux_builder.cgroup_procs = Some(cgroup_procs);
+        self
+    }
+
+    /// Closes inherited non-standard descriptors on exec (default: false).
+    ///
+    /// When enabled, descriptors 3 and above are marked close-on-exec before
+    /// explicit mappings, which remain available to the executable. Standard
+    /// streams retain their configured policies. Enrollment through
+    /// [`Self::set_cgroup_procs`] happens first and closes its descriptor.
+    ///
+    /// Requires vfork and an independent descriptor table. Failure, including
+    /// lack of kernel `close_range(CLOSE_RANGE_CLOEXEC)` support, aborts startup
+    /// regardless of the sandbox failure mode. The parent's descriptors are
+    /// unchanged. This is an exec boundary, not protection against fork-only
+    /// descendants of the trusted pre-exec code.
+    #[cfg(target_os = "linux")]
+    pub fn set_close_fds(&mut self, close: bool) -> &mut Self {
+        self.linux_builder.close_fds = close;
+        self
     }
 
     /// Sets the sandbox failure mode.
@@ -391,6 +448,34 @@ impl<'a> Builder<'a> {
 
     /// Spawns the process.
     pub fn spawn(&self) -> io::Result<Child> {
+        #[cfg(target_os = "linux")]
+        {
+            self.spawn_captured().map_err(|error| error.into_parts().0)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut prepared = self.prepare_spawn()?;
+            self.spawn_internal(&prepared.envp, &mut prepared.fd_ops)
+        }
+    }
+
+    /// Spawns the process, retaining its original child identity on failure
+    /// after clone has created it.
+    ///
+    /// A pre-exec failure may already have been reaped; the returned child's
+    /// wait methods then return its cached observed status. If reaping failed,
+    /// the caller retains the original child and pidfd and can retry the wait.
+    /// The caller is responsible for handling any child returned by
+    /// [`SpawnError::into_parts`]; dropping it does not terminate or reap it.
+    /// As with [`Self::spawn`], non-vfork startup failures may only be observed
+    /// later through the returned child's exit status.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_captured(&self) -> Result<Child, SpawnError> {
+        let mut prepared = self.prepare_spawn()?;
+        self.spawn_internal(&prepared.envp, &mut prepared.fd_ops)
+    }
+
+    fn prepare_spawn(&self) -> io::Result<PreparedSpawn> {
         let mut env = if self.clear_env {
             BTreeMap::new()
         } else {
@@ -435,7 +520,41 @@ impl<'a> Builder<'a> {
             fd_ops.push((2, op));
         }
 
-        self.spawn_internal(&envp, &mut fd_ops)
+        Ok(PreparedSpawn {
+            envp,
+            fd_ops,
+            _null_file: null_file,
+        })
+    }
+}
+
+/// A Linux spawn error that preserves ownership of any clone-created child.
+#[cfg(target_os = "linux")]
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct SpawnError {
+    #[source]
+    error: io::Error,
+    child: Option<Child>,
+}
+
+#[cfg(target_os = "linux")]
+impl SpawnError {
+    /// Returns the original IO error and any clone-created child.
+    ///
+    /// `None` means creation did not succeed. `Some` retains the original
+    /// child/pidfd, including when its pre-exec failure was already reaped.
+    /// The child's wait methods return a cached status in that case; otherwise
+    /// the caller must arrange to wait/reap it.
+    pub fn into_parts(self) -> (io::Error, Option<Child>) {
+        (self.error, self.child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<io::Error> for SpawnError {
+    fn from(error: io::Error) -> Self {
+        Self { error, child: None }
     }
 }
 
@@ -449,6 +568,22 @@ pub struct Child {
 }
 
 impl Child {
+    /// Terminates this child, not its descendants.
+    ///
+    /// On Linux the signal is addressed through the pidfd returned by clone,
+    /// never by reopening the numeric process ID.
+    #[cfg(target_os = "linux")]
+    pub fn kill(&self) -> io::Result<()> {
+        kill_pidfd(self.pidfd.as_fd())
+    }
+
+    /// Duplicates the stable, non-inheritable identity used to terminate this
+    /// child independently of its exit waiter.
+    #[cfg(target_os = "linux")]
+    pub fn termination_handle(&self) -> io::Result<ProcessHandle> {
+        Ok(ProcessHandle(self.pidfd.try_clone()?))
+    }
+
     /// Synchronously waits for the child process to exit.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         self.wait_internal(0).transpose().unwrap()
@@ -479,6 +614,47 @@ impl Child {
     pub fn id(&self) -> i32 {
         self.pid
     }
+}
+
+/// Stable Linux process identity. This does not own or contain descendants.
+#[cfg(target_os = "linux")]
+pub struct ProcessHandle(OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl ProcessHandle {
+    /// Requests SIGKILL for the identified process. Already-exited processes
+    /// are treated as success; waiting/reaping remains the child's responsibility.
+    pub fn kill(&self) -> io::Result<()> {
+        kill_pidfd(self.0.as_fd())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsFd for ProcessHandle {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pidfd(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: the pidfd is borrowed for the syscall and siginfo is null.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Terminates the process immediately.
