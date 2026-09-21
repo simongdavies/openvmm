@@ -38,11 +38,18 @@ use pal::windows::alpc::PortSection;
 use pal::windows::alpc::SendMessage;
 use pal::windows::create_object_directory;
 use pal::windows::open_object_directory;
+use pal::windows::security::LocalSecurityDescriptor;
+use pal::windows::security::MaximumSid;
+use pal::windows::security::SecurityDescriptor;
+use pal::windows::security::Sid;
+use pal::windows::security::current_process_user_sid;
+use pal::windows::security::grant_low_integrity_kernel_object_access;
 use pal_async::driver::Driver;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use pal_async::wait::PolledWait;
 use parking_lot::Mutex;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -101,6 +108,8 @@ impl Debug for MeshSecret {
 /// Errors from internal node setup (`with_id`).
 #[derive(Debug, thiserror::Error)]
 pub enum NodeSetupError {
+    #[error("failed to retain ALPC security handle")]
+    SecurityHandle(#[source] io::Error),
     #[error("failed to create ALPC port for node {node:?}")]
     CreateAlpcPort {
         node: NodeId,
@@ -131,6 +140,8 @@ pub enum NewNodeError {
 #[derive(Debug, thiserror::Error)]
 #[expect(missing_docs)]
 pub enum JoinError {
+    #[error("invalid endpoint security descriptor")]
+    SecurityDescriptor(#[source] io::Error),
     #[error("invalid directory path")]
     InvalidDirectoryPath,
     #[error("failed to open object directory {path}")]
@@ -224,10 +235,15 @@ impl InviteContext {
         driver: &impl Spawn,
         port: Port,
         dup_directory: bool,
+        directory_access: u32,
     ) -> Result<(InvitationCredentials, Option<OwnedHandle>, InvitationHandle), InviteError> {
         // Duplicate the handle first (fallible) before mutating shared state.
         let dir = if dup_directory {
-            Some(self.directory.as_handle().duplicate(true, Some(0))?)
+            Some(
+                self.directory
+                    .as_handle()
+                    .duplicate(true, Some(directory_access))?,
+            )
         } else {
             None
         };
@@ -242,6 +258,7 @@ impl InviteContext {
             InvitationCredentials {
                 address: addr,
                 mesh_secret: self.mesh_secret,
+                endpoint_security: None,
             },
             dir,
             handle,
@@ -293,7 +310,7 @@ impl InviteContext {
                     };
                     let dir_path = dir_path.clone();
                     rpc.handle_sync(|port| {
-                        let (creds, _, handle) = self.process_invite(&driver, port, false)?;
+                        let (creds, _, handle) = self.process_invite(&driver, port, false, 0)?;
                         Ok((
                             NamedInvitation {
                                 credentials: creds,
@@ -329,7 +346,8 @@ struct AlpcConnectionData {
     mesh_secret: MeshSecret,
 }
 
-/// The serializable portion of an invitation — address + mesh secret.
+/// The serializable portion of an invitation: address, mesh secret and optional
+/// endpoint security.
 /// Derives `Protobuf` so callers (e.g., `mesh_process`) can easily
 /// encode/decode it for passing to child processes.
 #[derive(Debug, Clone, Protobuf)]
@@ -338,6 +356,10 @@ pub struct InvitationCredentials {
     pub(crate) address: InvitationAddress,
     /// The mesh secret for ALPC connection auth.
     pub(crate) mesh_secret: MeshSecret,
+    /// Optional security descriptor for the joining node's server endpoint.
+    /// This is transient, private bootstrap ACL metadata, not persistent
+    /// AppContainer profile ownership or a way to recreate it from SID text.
+    endpoint_security: Option<String>,
 }
 
 /// Invitation for connecting already-running processes — pure data.
@@ -364,6 +386,8 @@ pub struct NamedInvitation {
 pub struct AlpcNode {
     driver: Box<dyn InvitationDriver>,
     invite_ctx: InviteContext,
+    // Invitation handlers can outlive shutdown and must not retain the listener.
+    server_security: Mutex<OwnedHandle>,
     recv_abort: AbortHandle,
     recv_task: Task<()>,
     connect_task: Task<()>,
@@ -483,6 +507,49 @@ fn node_path(node_id: NodeId) -> UnicodeString {
     format!("{:?}", node_id).try_into().unwrap()
 }
 
+fn invitation_endpoint_security<'a>(
+    own_sid: Option<&Sid>,
+    peer_sids: impl IntoIterator<Item = &'a Sid>,
+) -> io::Result<String> {
+    fn package_sid_text(sid: &Sid) -> io::Result<String> {
+        let text = sid.to_string_sid();
+        if !text.starts_with("S-1-15-2-") || text.split('-').count() != 11 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a unique package SID",
+            ));
+        }
+        Ok(text)
+    }
+
+    let own_sid = own_sid.map(package_sid_text).transpose()?;
+    let mut peers = BTreeSet::new();
+    for peer_sid in peer_sids {
+        let peer_text = package_sid_text(peer_sid)?;
+        if own_sid.as_deref() == Some(peer_text.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AppContainer peer SID must differ from its own SID",
+            ));
+        }
+        peers.insert(peer_text);
+    }
+    let mut access = String::new();
+    if let Some(own_sid) = own_sid {
+        access.push_str(&format!("(A;;GA;;;{own_sid})"));
+    }
+    for peer in peers {
+        access.push_str(&format!("(A;;0x1;;;{peer})"));
+    }
+    // The default object owner can be Administrators for an elevated parent.
+    // The user SID still participates in the child's token.
+    let user = current_process_user_sid()?;
+    Ok(format!(
+        "D:P(A;;GA;;;{})(A;;GA;;;SY){access}S:(ML;;NW;;;LW)",
+        user.to_string_sid()
+    ))
+}
+
 impl AlpcNode {
     /// Creates a node within a new mesh, with an anonymous Ob directory.
     ///
@@ -533,6 +600,7 @@ impl AlpcNode {
             directory,
             secret,
             directory_path,
+            None,
         )?)
     }
 
@@ -555,20 +623,28 @@ impl AlpcNode {
         directory: OwnedHandle,
         mesh_secret: MeshSecret,
         directory_path: Option<String>,
+        security_descriptor: Option<&SecurityDescriptor>,
     ) -> Result<Self, NodeSetupError> {
         let directory = Arc::new(directory);
+        let name = node_path(local_id);
+        let mut attributes = ObjectAttributes::new();
+        attributes.root(directory.as_handle()).name(&name);
+        if let Some(descriptor) = security_descriptor {
+            attributes.security_descriptor(descriptor);
+        }
         let port = alpc::PortConfig::new()
             .max_message_len(MAX_MESSAGE_SIZE)
             .waitable(true)
-            .create(
-                ObjectAttributes::new()
-                    .root(directory.as_handle())
-                    .name(&node_path(local_id)),
-            )
+            .create(&attributes)
             .map_err(|e| NodeSetupError::CreateAlpcPort {
                 node: local_id,
                 source: e,
             })?;
+        let server_security = Mutex::new(
+            port.as_handle()
+                .try_clone_to_owned()
+                .map_err(NodeSetupError::SecurityHandle)?,
+        );
         let port =
             PolledWait::new(&driver, port).map_err(|e| NodeSetupError::CreatePolledWait {
                 node: local_id,
@@ -630,6 +706,7 @@ impl AlpcNode {
         Ok(Self {
             driver: Box::new(driver),
             invite_ctx,
+            server_security,
             recv_abort,
             recv_task,
             connect_task,
@@ -827,13 +904,145 @@ impl AlpcNode {
     /// `port` with the initial port.
     pub fn invite(&self, port: Port) -> Result<(Invitation, InvitationHandle), InviteError> {
         let (creds, dup_dir, invite_handle) =
-            self.invite_ctx.process_invite(&self.driver, port, true)?;
+            self.invite_ctx
+                .process_invite(&self.driver, port, true, 0)?;
         Ok((
             Invitation {
                 credentials: creds,
                 directory: dup_dir.expect("requested"),
             },
             invite_handle,
+        ))
+    }
+
+    /// Invites a trusted ordinary-user child whose endpoint accepts only the
+    /// supplied exact AppContainer peers in addition to the user and SYSTEM.
+    ///
+    /// This is an explicit trusted-host policy, not AppContainer confinement.
+    /// The child must run as the current user. Each peer receives PORT_CONNECT
+    /// access and the endpoint has a low-integrity label. SIDs are validated
+    /// and deduplicated before invitation setup; no child package SID is
+    /// invented. An empty list preserves [`Self::invite`] behavior.
+    ///
+    /// The inherited directory handle is attenuated to traverse/create-object.
+    /// No peer grants are added to this node's directory or endpoint here:
+    /// peers join the same mesh through their own AppContainer invitations.
+    /// Their endpoints' existing current-user grant permits the reverse
+    /// connection. Identity ownership and replacement requirements from
+    /// [`Self::invite_app_container_with_peers`] still apply to those peers.
+    pub fn invite_with_app_container_peers(
+        &self,
+        port: Port,
+        peer_sids: &[MaximumSid],
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        if peer_sids.is_empty() {
+            return self.invite(port);
+        }
+        let security = invitation_endpoint_security(None, peer_sids.iter().map(AsRef::as_ref))?;
+        self.invite_with_endpoint_security(port, security)
+    }
+
+    /// Invites an AppContainer through exact-SID grants on this mesh's owned
+    /// directory and server port, with low-integrity endpoint labels.
+    ///
+    /// Grants are accumulated for the lifetime of this node. Serialized
+    /// read-modify-write updates preserve earlier siblings' access. The joining
+    /// endpoint grants its own package SID and the parent user access, allowing
+    /// the reverse connection without an ALL APPLICATION PACKAGES grant.
+    /// This authorizes communication with the parent, not direct connections
+    /// between differently identified AppContainers.
+    /// The inherited directory handle is also attenuated to traverse and
+    /// create-object access: it carries no security-management or delete rights.
+    pub fn invite_app_container(
+        &self,
+        port: Port,
+        sid: &Sid,
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        self.invite_app_container_inner(port, sid, std::iter::empty())
+    }
+
+    /// Invites an AppContainer whose endpoint also accepts one exact peer
+    /// package SID with PORT_CONNECT access.
+    ///
+    /// See [`Self::invite_app_container_with_peers`] for topology and identity
+    /// lifetime requirements.
+    pub fn invite_app_container_with_peer(
+        &self,
+        port: Port,
+        sid: &Sid,
+        peer_sid: &Sid,
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        self.invite_app_container_inner(port, sid, std::iter::once(peer_sid))
+    }
+
+    /// Invites an AppContainer with an owned launch-time endpoint descriptor
+    /// granting PORT_CONNECT only to the supplied exact peer package SIDs.
+    ///
+    /// All identities are validated and duplicates removed before ACL updates.
+    /// No peers are inferred from other invitations. Configure reciprocal
+    /// grants: a star hub accepts every spoke SID, while each spoke accepts only
+    /// the hub SID. Transferred Mesh ports establish new named ALPC connections,
+    /// rather than transferring authorized kernel connection handles.
+    ///
+    /// The descriptor is transient, private invitation ACL metadata: an
+    /// immutable launch-time snapshot, not persistent profile ownership. Before
+    /// the first launch, the trusted caller must prepare the entire topology
+    /// and retain owned registered profiles with distinct SIDs for concurrently
+    /// isolated logical workers in one fresh sandbox lifetime. There is no
+    /// post-launch grant or revocation API.
+    ///
+    /// A retained profile may serve a replacement generation only after the old
+    /// root is reaped and its job is empty. Fresh sandbox reconstruction requires
+    /// new owned profiles and SIDs; neither serialized SID text nor a name or
+    /// digest recreates ownership. Never share profiles across independent
+    /// sandbox lifetimes.
+    pub fn invite_app_container_with_peers(
+        &self,
+        port: Port,
+        sid: &Sid,
+        peer_sids: &[MaximumSid],
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        self.invite_app_container_inner(port, sid, peer_sids.iter().map(AsRef::as_ref))
+    }
+
+    fn invite_app_container_inner<'a>(
+        &self,
+        port: Port,
+        sid: &Sid,
+        peer_sids: impl IntoIterator<Item = &'a Sid>,
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        let security = invitation_endpoint_security(Some(sid), peer_sids)?;
+        {
+            let server = self.server_security.lock();
+            grant_low_integrity_kernel_object_access(
+                self.invite_ctx.directory.as_handle(),
+                sid,
+                DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT,
+            )?;
+            // ALPC ports require PORT_CONNECT (0x1) for a connection.
+            grant_low_integrity_kernel_object_access(server.as_handle(), sid, 1)?;
+        }
+        self.invite_with_endpoint_security(port, security)
+    }
+
+    fn invite_with_endpoint_security(
+        &self,
+        port: Port,
+        security: String,
+    ) -> Result<(Invitation, InvitationHandle), InviteError> {
+        let (mut credentials, directory, handle) = self.invite_ctx.process_invite(
+            &self.driver,
+            port,
+            true,
+            DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT,
+        )?;
+        credentials.endpoint_security = Some(security);
+        Ok((
+            Invitation {
+                credentials,
+                directory: directory.expect("requested"),
+            },
+            handle,
         ))
     }
 
@@ -845,12 +1054,20 @@ impl AlpcNode {
         port: Port,
     ) -> Result<Self, JoinError> {
         let mesh_secret = invitation.credentials.mesh_secret;
+        let security_descriptor = invitation
+            .credentials
+            .endpoint_security
+            .as_deref()
+            .map(str::parse::<LocalSecurityDescriptor>)
+            .transpose()
+            .map_err(JoinError::SecurityDescriptor)?;
         let node = Self::with_id(
             driver,
             invitation.credentials.address.local_addr.node,
             invitation.directory,
             mesh_secret,
             None,
+            security_descriptor.as_deref(),
         )?;
         let init_port = mesh_channel::OneshotSender::<InitialMessage>::from(
             node.invite_ctx.local_node.add_port(
@@ -890,6 +1107,7 @@ impl AlpcNode {
             directory,
             mesh_secret,
             Some(invitation.directory_path),
+            None,
         )?;
         let init_port = mesh_channel::OneshotSender::<InitialMessage>::from(
             node.invite_ctx.local_node.add_port(
@@ -1222,11 +1440,111 @@ mod tests {
     use test_with_tracing::test;
     use unix_socket::UnixStream;
 
+    async fn bounded<T>(driver: &DefaultDriver, future: impl Future<Output = T>) -> T {
+        use futures_concurrency::future::Race;
+        use pal_async::timer::PolledTimer;
+        use std::time::Duration;
+
+        (async { Some(future.await) }, async {
+            PolledTimer::new(driver).sleep(Duration::from_secs(5)).await;
+            None
+        })
+            .race()
+            .await
+            .expect("ALPC test timed out")
+    }
+
+    fn node_security(node: &AlpcNode) -> [String; 2] {
+        use pal::windows::security::LocalSecurityDescriptor;
+        use std::os::windows::io::AsHandle;
+
+        let server = node.server_security.lock();
+        [node.invite_ctx.directory.as_handle(), server.as_handle()].map(|handle| {
+            LocalSecurityDescriptor::from_kernel_object(handle)
+                .unwrap()
+                .to_sddl()
+                .unwrap()
+        })
+    }
+
+    fn handle_access(handle: std::os::windows::io::BorrowedHandle<'_>) -> u32 {
+        use std::os::windows::io::AsRawHandle;
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryObject(
+                handle: *mut std::ffi::c_void,
+                information_class: i32,
+                information: *mut std::ffi::c_void,
+                length: u32,
+                returned: *mut u32,
+            ) -> i32;
+        }
+
+        // PUBLIC_OBJECT_BASIC_INFORMATION contains four ULONG fields followed
+        // by ten reserved ULONGs. Its second field is the effective access mask.
+        let mut information = [0u32; 14];
+        // SAFETY: The handle remains borrowed and the output buffer matches the
+        // documented ObjectBasicInformation layout and size.
+        let status = unsafe {
+            NtQueryObject(
+                handle.as_raw_handle(),
+                0,
+                information.as_mut_ptr().cast(),
+                size_of_val(&information) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "NtQueryObject status {status:#x}");
+        information[1]
+    }
+
+    #[async_test]
+    async fn retained_inviter_does_not_keep_server_after_shutdown(driver: DefaultDriver) {
+        use futures_concurrency::future::Race;
+        use pal::windows::ObjectAttributes;
+        use pal::windows::alpc;
+        use pal_async::timer::PolledTimer;
+        use std::os::windows::io::AsHandle;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let node = AlpcNode::new_named(driver.clone()).unwrap();
+        let inviter = node.inviter();
+        let directory = Arc::clone(&node.invite_ctx.directory);
+        let name = super::node_path(node.id());
+        let mut attributes = ObjectAttributes::new();
+        attributes.root(directory.as_handle()).name(&name);
+        let create_server = || {
+            alpc::PortConfig::new()
+                .max_message_len(super::MAX_MESSAGE_SIZE)
+                .waitable(true)
+                .create(&attributes)
+        };
+        assert!(create_server().is_err(), "live listener must own its name");
+        (node.shutdown(), async {
+            PolledTimer::new(&driver)
+                .sleep(Duration::from_secs(5))
+                .await;
+            panic!("ALPC shutdown timed out");
+        })
+            .race()
+            .await;
+
+        // Probe name reuse without connecting to a receiver-less listener.
+        let replacement = create_server()
+            .expect("retained inviter must not retain the shut-down server endpoint");
+        drop((replacement, inviter));
+    }
+
     #[async_test]
     async fn test_two(driver: DefaultDriver) {
+        use std::os::windows::io::AsHandle;
+
         let (send, recv) = channel::<u32>();
         let node1 = AlpcNode::new(driver.clone()).unwrap();
         let (invitation, _handle) = node1.invite(recv.into()).unwrap();
+        assert_eq!(handle_access(invitation.directory.as_handle()), 0);
 
         let (send2, mut recv2) = channel::<u32>();
         let node2 = AlpcNode::join(driver, invitation, send2.into()).unwrap();
@@ -1237,6 +1555,480 @@ mod tests {
         drop(recv2);
         node1.shutdown().await;
         node2.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_app_container_grants_preserve_siblings(driver: DefaultDriver) {
+        use pal::windows::security::LocalSecurityDescriptor;
+        use pal::windows::security::MaximumSid;
+        use std::os::windows::io::AsHandle;
+
+        let first_sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let second_sid: MaximumSid = "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap();
+        let parent = AlpcNode::new(driver.clone()).unwrap();
+        let (first_send, first_port) = channel::<(u32, mesh_channel::Sender<u32>)>();
+        let (invitation, _first_handle) = parent
+            .invite_app_container(first_port.into(), first_sid.as_ref())
+            .unwrap();
+        assert_eq!(
+            handle_access(invitation.directory.as_handle()),
+            super::DIRECTORY_TRAVERSE | super::DIRECTORY_CREATE_OBJECT
+        );
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Security::Authorization::SE_KERNEL_OBJECT;
+            use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
+            use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+            use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
+            let descriptor = LocalSecurityDescriptor::from_kernel_object(
+                parent.invite_ctx.directory.as_handle(),
+            )
+            .unwrap();
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut dacl = std::ptr::null_mut();
+            // SAFETY: The descriptor and handles remain live. The attempted
+            // update is the unchanged DACL, and must fail on the limited handle.
+            unsafe {
+                assert_ne!(
+                    GetSecurityDescriptorDacl(
+                        descriptor.as_ptr(),
+                        &mut present,
+                        &mut dacl,
+                        &mut defaulted
+                    ),
+                    0
+                );
+                assert_eq!(
+                    SetSecurityInfo(
+                        invitation.directory.as_raw_handle(),
+                        SE_KERNEL_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dacl,
+                        std::ptr::null_mut(),
+                    ),
+                    windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED
+                );
+            }
+        }
+        let (first_local, mut first_recv) = channel::<(u32, mesh_channel::Sender<u32>)>();
+        let first = AlpcNode::join(driver.clone(), invitation, first_local.into()).unwrap();
+
+        let (second_send, second_port) = channel::<(u32, mesh_channel::Sender<u32>)>();
+        let (invitation, _second_handle) = parent
+            .invite_app_container(second_port.into(), second_sid.as_ref())
+            .unwrap();
+        assert_eq!(
+            handle_access(invitation.directory.as_handle()),
+            super::DIRECTORY_TRAVERSE | super::DIRECTORY_CREATE_OBJECT
+        );
+        let (second_local, mut second_recv) = channel::<(u32, mesh_channel::Sender<u32>)>();
+        let second = AlpcNode::join(driver, invitation, second_local.into()).unwrap();
+
+        {
+            let server = parent.server_security.lock();
+            for handle in [parent.invite_ctx.directory.as_handle(), server.as_handle()] {
+                let descriptor = LocalSecurityDescriptor::from_kernel_object(handle)
+                    .unwrap()
+                    .to_sddl()
+                    .unwrap();
+                assert!(
+                    descriptor.contains(&first_sid.to_string_sid()),
+                    "{descriptor}"
+                );
+                assert!(
+                    descriptor.contains(&second_sid.to_string_sid()),
+                    "{descriptor}"
+                );
+                assert!(descriptor.contains("(ML;;NW;;;LW)"), "{descriptor}");
+                assert!(!descriptor.contains(";;;AC)"), "{descriptor}");
+                assert!(!descriptor.contains(";;;WD)"), "{descriptor}");
+            }
+        }
+
+        // These nodes run under the test's ordinary token. This verifies the
+        // live ACLs and both transport directions, not AppContainer execution.
+        for (send, recv, value) in [
+            (&first_send, &mut first_recv, 31),
+            (&second_send, &mut second_recv, 41),
+        ] {
+            let (reply, mut response) = channel();
+            send.send((value, reply));
+            let (value, reply) = recv.recv().await.unwrap();
+            reply.send(value + 1);
+            assert_eq!(response.recv().await.unwrap(), value + 1);
+        }
+        drop(first_send);
+        drop(first_recv);
+        first.shutdown().await;
+        let (reply, mut response) = channel();
+        second_send.send((51, reply));
+        let (value, reply) = second_recv.recv().await.unwrap();
+        reply.send(value + 1);
+        assert_eq!(response.recv().await.unwrap(), 52);
+        drop(second_send);
+        drop(second_recv);
+        second.shutdown().await;
+        parent.shutdown().await;
+    }
+
+    fn endpoint_sid_access(node: &AlpcNode, sid: &pal::windows::security::Sid) -> u32 {
+        use pal::windows::security::LocalSecurityDescriptor;
+        use std::os::windows::io::AsHandle;
+        use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+        use windows_sys::Win32::Security::ACE_HEADER;
+        use windows_sys::Win32::Security::EqualSid;
+        use windows_sys::Win32::Security::GetAce;
+        use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+
+        let server = node.server_security.lock();
+        let descriptor = LocalSecurityDescriptor::from_kernel_object(server.as_handle()).unwrap();
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        let mut access = 0;
+        // SAFETY: The kernel-returned descriptor owns the validated ACL and
+        // ACE storage throughout enumeration; each ACE's type is checked.
+        unsafe {
+            assert_ne!(
+                GetSecurityDescriptorDacl(
+                    descriptor.as_ptr(),
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted
+                ),
+                0
+            );
+            assert_ne!(present, 0);
+            assert!(!dacl.is_null());
+            for index in 0..(*dacl).AceCount {
+                let mut ace = std::ptr::null_mut();
+                assert_ne!(GetAce(dacl, u32::from(index), &mut ace), 0);
+                if (*ace.cast::<ACE_HEADER>()).AceType == 0 {
+                    let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+                    if EqualSid(std::ptr::addr_of_mut!((*ace).SidStart).cast(), sid.as_ptr()) != 0 {
+                        access |= (*ace).Mask;
+                    }
+                }
+            }
+        }
+        access
+    }
+
+    #[async_test]
+    async fn test_app_container_paired_endpoint_transfer(driver: DefaultDriver) {
+        use pal::windows::security::MaximumSid;
+
+        type Message = (u32, mesh_channel::Sender<u32>);
+
+        let first_sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let second_sid: MaximumSid = "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap();
+        let unrelated_sid: MaximumSid = "S-1-15-2-15-16-17-18-19-20-21".parse().unwrap();
+        let broad_sid: MaximumSid = "S-1-15-2-1".parse().unwrap();
+        let everyone: MaximumSid = "S-1-1-0".parse().unwrap();
+        let parent = AlpcNode::new(driver.clone()).unwrap();
+
+        let (first_send, first_port) = channel::<mesh_channel::Sender<Message>>();
+        let (invitation, _first_handle) = parent
+            .invite_app_container_with_peer(
+                first_port.into(),
+                first_sid.as_ref(),
+                second_sid.as_ref(),
+            )
+            .unwrap();
+        let (first_local, mut first_recv) = channel::<mesh_channel::Sender<Message>>();
+        let first = AlpcNode::join(driver.clone(), invitation, first_local.into()).unwrap();
+
+        let (second_send, second_port) = channel::<mesh_channel::Receiver<Message>>();
+        let (invitation, _second_handle) = parent
+            .invite_app_container_with_peer(
+                second_port.into(),
+                second_sid.as_ref(),
+                first_sid.as_ref(),
+            )
+            .unwrap();
+        let (second_local, mut second_recv) = channel::<mesh_channel::Receiver<Message>>();
+        let second = AlpcNode::join(driver.clone(), invitation, second_local.into()).unwrap();
+
+        let (unrelated_send, unrelated_port) = channel::<()>();
+        let (invitation, _unrelated_handle) = parent
+            .invite_app_container(unrelated_port.into(), unrelated_sid.as_ref())
+            .unwrap();
+        let (unrelated_local, unrelated_recv) = channel::<()>();
+        let unrelated = AlpcNode::join(driver, invitation, unrelated_local.into()).unwrap();
+
+        assert_eq!(endpoint_sid_access(&first, second_sid.as_ref()), 1);
+        assert_eq!(endpoint_sid_access(&second, first_sid.as_ref()), 1);
+        for node in [&first, &second] {
+            for sid in [&unrelated_sid, &broad_sid, &everyone] {
+                assert_eq!(endpoint_sid_access(node, sid.as_ref()), 0);
+            }
+        }
+        assert_eq!(endpoint_sid_access(&unrelated, first_sid.as_ref()), 0);
+        assert_eq!(endpoint_sid_access(&unrelated, second_sid.as_ref()), 0);
+
+        let (send, recv) = channel::<Message>();
+        first_send.send(send);
+        second_send.send(recv);
+        let direct_send = first_recv.recv().await.unwrap();
+        let mut direct_recv = second_recv.recv().await.unwrap();
+        drop((first_send, first_recv, second_send, second_recv));
+        drop((unrelated_send, unrelated_recv));
+        unrelated.shutdown().await;
+        parent.shutdown().await;
+
+        // Ordinary-token transport and live ACL qualification only. The
+        // parent is gone, so request/reply cannot rely on an application relay.
+        let (reply, mut response) = channel();
+        direct_send.send((71, reply));
+        let (value, reply) = direct_recv.recv().await.unwrap();
+        reply.send(value + 1);
+        assert_eq!(response.recv().await.unwrap(), 72);
+        drop((direct_send, direct_recv, response));
+        first.shutdown().await;
+        second.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_trusted_host_endpoint_scopes_exact_peers(driver: DefaultDriver) {
+        use pal::windows::security::MaximumSid;
+        use std::os::windows::io::AsHandle;
+
+        type Message = (u32, mesh_channel::Sender<u32>);
+        let peers: [MaximumSid; 2] = [
+            "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap(),
+            "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap(),
+        ];
+        let parent = AlpcNode::new(driver.clone()).unwrap();
+        let before = node_security(&parent);
+        let (send, port) = channel::<Message>();
+        let mut supplied = vec![peers[0], peers[1], peers[0]];
+        let (invitation, _handle) = parent
+            .invite_with_app_container_peers(port.into(), &supplied)
+            .unwrap();
+        supplied.clear();
+        let security = invitation.credentials.endpoint_security.as_ref().unwrap();
+        for sid in &peers {
+            assert_eq!(security.matches(&sid.to_string_sid()).count(), 1);
+        }
+        assert!(security.starts_with("D:P"));
+        assert!(security.contains("S:(ML;;NW;;;LW)"));
+        assert_eq!(
+            handle_access(invitation.directory.as_handle()),
+            super::DIRECTORY_TRAVERSE | super::DIRECTORY_CREATE_OBJECT
+        );
+        let (local, mut recv) = channel::<Message>();
+        let child = AlpcNode::join(driver.clone(), invitation, local.into()).unwrap();
+        assert_eq!(before, node_security(&parent));
+        for peer in &peers {
+            assert_eq!(endpoint_sid_access(&child, peer.as_ref()), 1);
+        }
+        for excluded in ["S-1-1-0", "S-1-15-2-1", "S-1-15-2-15-16-17-18-19-20-21"] {
+            let sid: MaximumSid = excluded.parse().unwrap();
+            assert_eq!(endpoint_sid_access(&child, sid.as_ref()), 0);
+        }
+        let (reply, mut response) = channel();
+        send.send((93, reply));
+        let (value, reply) = bounded(&driver, recv.recv()).await.unwrap();
+        reply.send(value + 1);
+        assert_eq!(bounded(&driver, response.recv()).await.unwrap(), 94);
+        drop((send, recv, response));
+        bounded(&driver, child.shutdown()).await;
+        bounded(&driver, parent.shutdown()).await;
+    }
+
+    #[async_test]
+    async fn test_trusted_host_peer_validation_precedes_invitation(driver: DefaultDriver) {
+        use pal::windows::security::MaximumSid;
+        use std::os::windows::io::AsHandle;
+
+        let valid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let parent = AlpcNode::new(driver.clone()).unwrap();
+        let before = node_security(&parent);
+        for invalid in [
+            "S-1-1-0",
+            "S-1-15-2-1",
+            "S-1-15-2-1-2-3",
+            "S-1-15-3-1-2-3-4-5-6-7",
+        ] {
+            let invalid: MaximumSid = invalid.parse().unwrap();
+            let (_, port) = channel::<()>();
+            let error = parent
+                .invite_with_app_container_peers(port.into(), &[valid, invalid])
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "expected a unique package SID");
+            assert!(parent.invite_ctx.invitations.lock().is_empty());
+            assert_eq!(before, node_security(&parent));
+        }
+        let (send, port) = channel::<()>();
+        let (invitation, handle) = parent
+            .invite_with_app_container_peers(port.into(), &[])
+            .unwrap();
+        assert!(invitation.credentials.endpoint_security.is_none());
+        assert_eq!(handle_access(invitation.directory.as_handle()), 0);
+        assert_eq!(before, node_security(&parent));
+        drop((invitation, handle, send));
+        bounded(&driver, parent.shutdown()).await;
+    }
+
+    #[async_test]
+    async fn test_app_container_peer_rejects_invalid_identity(driver: DefaultDriver) {
+        use pal::windows::security::LocalSecurityDescriptor;
+        use pal::windows::security::MaximumSid;
+        use std::os::windows::io::AsHandle;
+
+        let sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let valid_peer: MaximumSid = "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap();
+        let broad: MaximumSid = "S-1-15-2-1".parse().unwrap();
+        let parent = AlpcNode::new(driver).unwrap();
+        let before =
+            LocalSecurityDescriptor::from_kernel_object(parent.invite_ctx.directory.as_handle())
+                .unwrap()
+                .to_sddl()
+                .unwrap();
+        for (peer, error) in [
+            (&sid, "AppContainer peer SID must differ from its own SID"),
+            (&broad, "expected a unique package SID"),
+        ] {
+            let (_, port) = channel::<()>();
+            let result = parent
+                .invite_app_container_with_peer(port.into(), sid.as_ref(), peer.as_ref())
+                .err()
+                .unwrap();
+            assert_eq!(result.to_string(), error);
+            let (_, port) = channel::<()>();
+            let result = parent
+                .invite_app_container_with_peers(port.into(), sid.as_ref(), &[valid_peer, *peer])
+                .err()
+                .unwrap();
+            assert_eq!(result.to_string(), error);
+        }
+        let after =
+            LocalSecurityDescriptor::from_kernel_object(parent.invite_ctx.directory.as_handle())
+                .unwrap()
+                .to_sddl()
+                .unwrap();
+        assert_eq!(before, after);
+        parent.shutdown().await;
+    }
+
+    #[async_test]
+    async fn test_app_container_star_endpoint_transfer(driver: DefaultDriver) {
+        bounded(&driver, star_endpoint_transfer(driver.clone(), false)).await;
+    }
+
+    #[async_test]
+    async fn test_trusted_host_star_endpoint_transfer(driver: DefaultDriver) {
+        bounded(&driver, star_endpoint_transfer(driver.clone(), true)).await;
+    }
+
+    async fn star_endpoint_transfer(driver: DefaultDriver, trusted_host: bool) {
+        use pal::windows::security::MaximumSid;
+
+        type Message = (u32, mesh_channel::Sender<u32>);
+
+        let hub_sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let spoke_sids: [MaximumSid; 2] = [
+            "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap(),
+            "S-1-15-2-15-16-17-18-19-20-21".parse().unwrap(),
+        ];
+        let unrelated_sid: MaximumSid = "S-1-15-2-22-23-24-25-26-27-28".parse().unwrap();
+        let broad_sid: MaximumSid = "S-1-15-2-1".parse().unwrap();
+        let everyone: MaximumSid = "S-1-1-0".parse().unwrap();
+        let parent = AlpcNode::new(driver.clone()).unwrap();
+
+        let (hub_send, hub_port) = channel::<Vec<mesh_channel::Sender<Message>>>();
+        let mut supplied_peers = vec![spoke_sids[0], spoke_sids[1], spoke_sids[0]];
+        let (invitation, _hub_handle) = if trusted_host {
+            parent.invite_with_app_container_peers(hub_port.into(), &supplied_peers)
+        } else {
+            parent.invite_app_container_with_peers(
+                hub_port.into(),
+                hub_sid.as_ref(),
+                &supplied_peers,
+            )
+        }
+        .unwrap();
+        supplied_peers.clear();
+        for sid in &spoke_sids {
+            assert_eq!(
+                invitation
+                    .credentials
+                    .endpoint_security
+                    .as_ref()
+                    .unwrap()
+                    .matches(&sid.to_string_sid())
+                    .count(),
+                1
+            );
+        }
+        let (hub_local, mut hub_recv) = channel::<Vec<mesh_channel::Sender<Message>>>();
+        let hub = AlpcNode::join(driver.clone(), invitation, hub_local.into()).unwrap();
+
+        let mut spokes = Vec::new();
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        let spoke_peers = if trusted_host {
+            Vec::new()
+        } else {
+            vec![hub_sid]
+        };
+        for sid in &spoke_sids {
+            let (control_send, control_port) = channel::<mesh_channel::Receiver<Message>>();
+            let (invitation, _handle) = parent
+                .invite_app_container_with_peers(control_port.into(), sid.as_ref(), &spoke_peers)
+                .unwrap();
+            let (local, mut control_recv) = channel::<mesh_channel::Receiver<Message>>();
+            let spoke = AlpcNode::join(driver.clone(), invitation, local.into()).unwrap();
+            let (send, recv) = channel::<Message>();
+            control_send.send(recv);
+            receivers.push(control_recv.recv().await.unwrap());
+            senders.push(send);
+            spokes.push(spoke);
+        }
+        hub_send.send(senders);
+        let senders = hub_recv.recv().await.unwrap();
+        drop((hub_send, hub_recv));
+
+        for (index, spoke) in spokes.iter().enumerate() {
+            assert_eq!(endpoint_sid_access(&hub, spoke_sids[index].as_ref()), 1);
+            assert_eq!(
+                endpoint_sid_access(spoke, hub_sid.as_ref()),
+                if trusted_host { 0 } else { 1 }
+            );
+            assert_eq!(
+                endpoint_sid_access(spoke, spoke_sids[1 - index].as_ref()),
+                0
+            );
+        }
+        if trusted_host {
+            assert_eq!(endpoint_sid_access(&hub, hub_sid.as_ref()), 0);
+        }
+        for node in std::iter::once(&hub).chain(&spokes) {
+            for sid in [&unrelated_sid, &broad_sid, &everyone] {
+                assert_eq!(endpoint_sid_access(node, sid.as_ref()), 0);
+            }
+        }
+        parent.shutdown().await;
+
+        // Ordinary-token transport and exact endpoint ACLs, not an assertion
+        // that AppContainer tokens were used by these in-process nodes.
+        for (send, recv) in senders.iter().zip(&mut receivers) {
+            let (reply, mut response) = channel();
+            send.send((81, reply));
+            let (value, reply) = recv.recv().await.unwrap();
+            reply.send(value + 1);
+            assert_eq!(response.recv().await.unwrap(), 82);
+        }
+        drop((senders, receivers));
+        hub.shutdown().await;
+        for spoke in spokes {
+            spoke.shutdown().await;
+        }
     }
 
     #[async_test]
