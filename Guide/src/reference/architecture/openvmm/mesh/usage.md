@@ -362,6 +362,13 @@ let handle = host.launch_worker(DISK_WORKER, params).await?;
 When the worker host runs in a child process (via `mesh_process`), the
 same `launch_worker` call spawns the worker there instead.
 
+### Owning a host process
+
+Use `Mesh::launch_host_owned` for startup rollback and forced root termination.
+See [host process ownership and startup](../mesh.md#host-process-ownership)
+for the OS-exit guarantees, containment limits, and unsafe invitation capture
+contract.
+
 ## Quick reference
 
 | I want to... | Use |

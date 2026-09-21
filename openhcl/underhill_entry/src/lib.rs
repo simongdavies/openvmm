@@ -3,7 +3,7 @@
 
 //! The entry point for the underhill environment.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg(target_os = "linux")]
 
 // Use mimalloc instead of the system malloc for performance.
@@ -24,12 +24,21 @@ use fast_memcpy as _;
 
 /// Entry point into the underhill multi-binary, dispatching between various
 /// entrypoints based on argv0.
-pub fn underhill_main() -> anyhow::Result<()> {
+///
+/// # Safety
+///
+/// Must run before starting threads, with exclusive environment access and
+/// ownership of any inherited mesh resource, as required by
+/// [`underhill_core::main`].
+// UNSAFETY: Forwards the caller's startup guarantees to the core entry point.
+#[expect(unsafe_code)]
+pub unsafe fn underhill_main() -> anyhow::Result<()> {
     let argv0 = std::path::PathBuf::from(std::env::args_os().next().unwrap());
     match argv0.file_name().unwrap().to_str().unwrap() {
         "underhill-init" => underhill_init::main(),
         "underhill-crash" => underhill_crash::main(),
         "underhill-dump" => underhill_dump::main(),
-        _ => underhill_core::main(),
+        // SAFETY: this entry point preserves the caller's startup guarantees.
+        _ => unsafe { underhill_core::main() },
     }
 }

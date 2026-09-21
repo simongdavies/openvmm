@@ -4,8 +4,7 @@
 //! This module implements the interactive control process and the entry point
 //! for the worker process.
 
-#![expect(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod cli_args;
 mod crash_dump;
@@ -147,14 +146,26 @@ use vmgs_resources::VmgsResource;
 use vmotherboard::ChipsetDeviceHandle;
 use vnc_worker_defs::VncParameters;
 
-pub fn openvmm_main() {
+/// Runs OpenVMM from the process entry point.
+///
+/// # Safety
+///
+/// Must be called before starting threads, with exclusive environment access
+/// and ownership of any inherited mesh invitation resource as required by
+/// [`mesh_process::OwnedInvitation::capture_from_environment`].
+// UNSAFETY: Captures the inherited invitation under the caller's startup contract.
+#[expect(unsafe_code)]
+pub unsafe fn openvmm_main() {
+    // SAFETY: the process entry point supplies the capture guarantees.
+    let invitation = unsafe { mesh_process::OwnedInvitation::capture_from_environment() };
     // Save the current state of the terminal so we can restore it back to
     // normal before exiting.
     #[cfg(unix)]
     let orig_termios = io::stderr().is_terminal().then(term::get_termios);
 
     let mut pidfile_guard: Option<pidfile::Pidfile> = None;
-    let exit_code = match do_main(&mut pidfile_guard) {
+    let exit_code = match invitation.and_then(|invitation| do_main(&mut pidfile_guard, invitation))
+    {
         Ok(code) => code,
         Err(err) => {
             eprintln!("fatal error: {:?}", err);
@@ -2652,7 +2663,10 @@ fn prepare_snapshot_restore(
     Ok((shared_memory_fd, state_msg))
 }
 
-fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> {
+fn do_main(
+    pidfile_guard: &mut Option<pidfile::Pidfile>,
+    invitation: Option<mesh_process::OwnedInvitation>,
+) -> anyhow::Result<i32> {
     #[cfg(windows)]
     pal::windows::disable_hard_error_dialog();
 
@@ -2661,7 +2675,9 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     // Try to run as a worker host.
     // On success the worker runs to completion and then exits the process (does
     // not return). Any worker host setup errors are return and bubbled up.
-    meshworker::run_vmm_mesh_host()?;
+    if let Some(invitation) = invitation {
+        meshworker::run_vmm_mesh_host(invitation)?;
+    }
 
     let opt = cli_args::parse_options();
     if let Some(path) = &opt.write_saved_state_proto {

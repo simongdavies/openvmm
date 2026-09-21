@@ -4696,15 +4696,18 @@ dependencies = [
  "inspect",
  "inspect_rlimit",
  "inspect_task",
+ "libc",
  "mesh",
  "mesh_remote",
  "pal",
  "pal_async",
+ "parking_lot",
  "slab",
  "tempfile",
  "test_with_tracing",
  "tracing",
  "unicycle",
+ "windows-sys 0.61.0",
 ]
 
 [[package]]

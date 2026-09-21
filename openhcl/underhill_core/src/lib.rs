@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 #![expect(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod diag;
 mod dispatch;
@@ -59,8 +59,9 @@ use mesh::error::RemoteError;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use mesh_process::Mesh;
+use mesh_process::OwnedInvitation;
 use mesh_process::ProcessConfig;
-use mesh_process::try_run_mesh_host;
+use mesh_process::run_mesh_host;
 use mesh_tracing::RemoteTracer;
 use mesh_tracing::TracingBackend;
 use mesh_worker::RegisteredWorkers;
@@ -140,7 +141,17 @@ fn new_underhill_remote_console_cfg(
     }
 }
 
-pub fn main() -> anyhow::Result<()> {
+/// Runs the underhill core process.
+///
+/// # Safety
+///
+/// Must satisfy [`OwnedInvitation::capture_from_environment`], including
+/// exclusive environment access and ownership of the inherited mesh resource.
+// UNSAFETY: Captures the inherited invitation under the caller's startup contract.
+#[expect(unsafe_code)]
+pub unsafe fn main() -> anyhow::Result<()> {
+    // SAFETY: the entry point guarantees capture happens before starting threads.
+    let invitation = unsafe { OwnedInvitation::capture_from_environment() }?;
     // Install a panic hook to prefix the current async task name before the
     // standard panic output.
     install_task_name_panic_hook();
@@ -168,16 +179,19 @@ pub fn main() -> anyhow::Result<()> {
     //
     // On success the worker runs to completion and then exits the process (does
     // not return). Any worker host setup errors are return and bubbled up.
-    try_run_mesh_host("underhill", {
-        let tracing_driver = tracing_driver.clone();
-        async |params: MeshHostParams| {
-            if let Some(remote_tracer) = params.tracer {
-                init_tracing(tracing_driver, remote_tracer).context("failed to init tracing")?;
+    if let Some(invitation) = invitation {
+        run_mesh_host(invitation, "underhill", {
+            let tracing_driver = tracing_driver.clone();
+            async |params: MeshHostParams| {
+                if let Some(remote_tracer) = params.tracer {
+                    init_tracing(tracing_driver, remote_tracer)
+                        .context("failed to init tracing")?;
+                }
+                params.runner.run(RegisteredWorkers).await;
+                Ok(())
             }
-            params.runner.run(RegisteredWorkers).await;
-            Ok(())
-        }
-    })?;
+        })?;
+    }
 
     // Initialize the tracing backend used by this and all subprocesses.
     let mut tracing = init_tracing_backend(tracing_driver.clone())?;

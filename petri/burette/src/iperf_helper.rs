@@ -59,12 +59,18 @@ pub struct TapConfig {
 
 /// Entry point for the plain iperf3 helper (no namespace).
 ///
-/// Can be called at any point — no single-threaded requirement.
-pub fn run_helper() {
-    if let Err(e) = mesh_process::try_run_mesh_host("burette", async |init: IperfHelperInit| {
-        run_helper_inner(init).await;
-        Ok(())
-    }) {
+/// The invitation must already have been captured at single-threaded startup.
+/// Running the helper with an owned invitation has no single-threaded requirement.
+pub fn run_helper(invitation: Option<mesh_process::OwnedInvitation>) {
+    let Some(invitation) = invitation else {
+        return;
+    };
+    if let Err(e) =
+        mesh_process::run_mesh_host(invitation, "burette", async |init: IperfHelperInit| {
+            run_helper_inner(init).await;
+            Ok(())
+        })
+    {
         eprintln!("iperf helper failed: {e}");
         std::process::exit(1);
     }
@@ -134,7 +140,7 @@ pub mod linux {
     /// This MUST be called before any threads are spawned (before clap
     /// parsing, before pal_async pool creation). The `unshare()` syscall
     /// requires a single-threaded process.
-    pub fn run_tap_helper() {
+    pub fn run_tap_helper(invitation: Option<mesh_process::OwnedInvitation>) {
         // SAFETY: unshare() with CLONE_NEWUSER | CLONE_NEWNET is safe — it only
         // affects the calling process's namespace membership.
         let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
@@ -152,7 +158,7 @@ pub mod linux {
         }
 
         // Now join mesh and serve — same as the plain helper.
-        super::run_helper();
+        super::run_helper(invitation);
     }
 
     /// Create and configure a TAP device. Returns the TAP fd.

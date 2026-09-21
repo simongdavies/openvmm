@@ -3,7 +3,7 @@
 
 //! Root binary crate for builds of OpenVMM-HCL.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 // Link resources.
 #[cfg(target_os = "linux")]
@@ -22,4 +22,11 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-use underhill_entry::underhill_main as main;
+// UNSAFETY: Supplies single-threaded startup guarantees to invitation capture.
+#[expect(unsafe_code)]
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // SAFETY: no threads have been started or inherited mesh resource adopted.
+    // A mesh invitation, when present, is supplied by our trusted launcher.
+    unsafe { underhill_entry::underhill_main() }?;
+    Ok(())
+}

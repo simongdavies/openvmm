@@ -9,9 +9,9 @@
 //! (`mesh_remote`): Unix domain sockets on Linux, ALPC on Windows.
 //!
 //! The child process receives an invitation via an environment variable and
-//! calls [`try_run_mesh_host()`] early in `main()` to join the mesh. Once
-//! joined, ports (and the resources they carry) flow transparently between
-//! parent and child.
+//! captures an [`OwnedInvitation`] before starting threads, then passes it to
+//! [`run_mesh_host()`] to join the mesh. Once joined, ports (and the resources
+//! they carry) flow transparently between parent and child.
 //!
 //! This crate is used by OpenVMM to launch worker processes and by OpenHCL to
 //! run device emulators in isolated child processes.
@@ -63,6 +63,15 @@ use tracing::Instrument;
 use tracing::instrument;
 use unicycle::FuturesUnordered;
 
+#[cfg(any(windows, target_os = "linux"))]
+mod owned_host;
+#[cfg(any(windows, target_os = "linux"))]
+pub use owned_host::{OwnedHost, RootExit};
+#[cfg(any(windows, target_os = "linux"))]
+mod pending_host;
+#[cfg(any(windows, target_os = "linux"))]
+pub use pending_host::{LaunchCompletion, PendingHostLaunch};
+
 #[cfg(windows)]
 mod plat {
     pub type IpcNode = mesh_remote::windows::AlpcNode;
@@ -102,6 +111,131 @@ struct Invitation {
 
 static PROCESS_NAME: DebugPtr<String> = DebugPtr::new();
 
+static INVITATION_CAPTURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// An invitation that exclusively owns its inherited IPC resource.
+///
+/// Capture this before starting threads or tracing. It can then be moved to
+/// [`run_mesh_host`] after other initialization, or dropped to close the resource.
+pub struct OwnedInvitation {
+    node_name: String,
+    #[cfg(unix)]
+    invitation: mesh_remote::unix::UnixInvitation,
+    #[cfg(windows)]
+    invitation: mesh_remote::windows::AlpcInvitation,
+}
+
+impl OwnedInvitation {
+    /// Takes the invitation from the process environment, if present.
+    ///
+    /// This may be called only once, including when the invitation is absent or
+    /// malformed. The environment entry is removed before decoding; invalid or
+    /// non-Unicode entries are errors, not an absent invitation. The inherited
+    /// resource is made non-inheritable before returning.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have exclusive access to the process environment:
+    /// no other thread or foreign code may read or write it during this call.
+    /// Call this at process startup before starting threads (including tracing).
+    ///
+    /// If the entry decodes, it must have come from a trusted mesh launcher and
+    /// identify a valid inherited socket fd (Unix) or directory handle
+    /// (Windows). The caller must transfer exclusive ownership of that resource:
+    /// it must not already have an owner, be closed, or be used concurrently.
+    /// No process may be spawned concurrently before inheritance is disabled.
+    pub unsafe fn capture_from_environment() -> anyhow::Result<Option<Self>> {
+        claim_invitation(&INVITATION_CAPTURED)?;
+        let Some(value) = std::env::var_os(INVITATION_ENV_NAME) else {
+            return Ok(None);
+        };
+        // SAFETY: exclusive environment access is required by the caller contract.
+        unsafe { std::env::remove_var(INVITATION_ENV_NAME) };
+        let invitation = decode_invitation(value)?;
+        // SAFETY: the caller transfers exclusive ownership of the decoded resource.
+        unsafe { Self::from_inherited(invitation) }.map(Some)
+    }
+
+    /// Takes exclusive ownership of the inherited IPC resource.
+    ///
+    /// # Safety
+    ///
+    /// The invitation must name a valid inherited socket fd or directory
+    /// handle with no existing owner or concurrent users. No process may be
+    /// spawned concurrently before this function disables inheritance.
+    unsafe fn from_inherited(invitation: Invitation) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        let owned = {
+            // SAFETY: the caller guarantees a valid, exclusively owned socket fd.
+            let fd = unsafe { OwnedFd::from_raw_fd(invitation.socket_fd) };
+            // SAFETY: fcntl operates on our live fd and takes no pointer arguments.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to read invitation fd flags");
+            }
+            // SAFETY: fd is live and flags contains the existing descriptor flags.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to make invitation fd close-on-exec");
+            }
+            mesh_remote::unix::UnixInvitation {
+                address: invitation.address,
+                fd,
+            }
+        };
+        #[cfg(windows)]
+        let owned = {
+            // SAFETY: the caller transfers a valid, exclusively owned directory handle.
+            let directory =
+                unsafe { OwnedHandle::from_raw_handle(invitation.directory_handle as RawHandle) };
+            // SAFETY: directory owns a live handle throughout this call.
+            if unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(
+                    directory.as_raw_handle(),
+                    windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+                    0,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to make invitation handle non-inheritable");
+            }
+            mesh_remote::windows::AlpcInvitation::new(invitation.credentials, directory)
+        };
+        Ok(Self {
+            node_name: invitation.node_name,
+            invitation: owned,
+        })
+    }
+}
+
+fn claim_invitation(captured: &std::sync::atomic::AtomicBool) -> anyhow::Result<()> {
+    captured
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .map_err(|_| anyhow::anyhow!("mesh invitation has already been captured"))?;
+    Ok(())
+}
+
+fn decode_invitation(value: OsString) -> anyhow::Result<Invitation> {
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("mesh invitation is not Unicode"))?;
+    mesh::payload::decode(
+        &base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .context("failed to base64 decode invitation")?,
+    )
+    .context("failed to protobuf decode invitation")
+}
+
 /// Runs a mesh host in the current thread, then exits the process, if this
 /// process was launched by [`Mesh::launch_host`].
 ///
@@ -110,37 +244,63 @@ static PROCESS_NAME: DebugPtr<String> = DebugPtr::new();
 /// If a mesh invitation is available, this function joins the mesh and runs the
 /// future returned by `f` until `f` returns or the parent process shuts down
 /// the mesh.
-pub fn try_run_mesh_host<U, F, T>(base_name: &str, f: F) -> anyhow::Result<()>
+///
+/// This compatibility entry point is now unsafe. Prefer capturing an
+/// [`OwnedInvitation`] at startup and calling [`run_mesh_host`] later.
+///
+/// # Safety
+///
+/// The caller must meet all the environment-access and inherited-resource
+/// ownership requirements of [`OwnedInvitation::capture_from_environment`].
+pub unsafe fn try_run_mesh_host<U, F, T>(base_name: &str, f: F) -> anyhow::Result<()>
+where
+    U: 'static + MeshPayload + Send,
+    F: AsyncFnOnce(U) -> anyhow::Result<T>,
+{
+    // SAFETY: this function has the same capture contract.
+    if let Some(invitation) = unsafe { OwnedInvitation::capture_from_environment() }? {
+        run_mesh_host(invitation, base_name, f)?;
+    }
+    Ok(())
+}
+
+/// Consumes an owned invitation, joins the mesh, runs the host, and exits.
+///
+/// This does not access or mutate the invitation environment variable, or
+/// adopt any raw resource. It is safe to call after starting other threads.
+/// Returns only if joining, initialization, or the host future fails.
+pub fn run_mesh_host<U, F, T>(
+    invitation: OwnedInvitation,
+    base_name: &str,
+    f: F,
+) -> anyhow::Result<()>
 where
     U: 'static + MeshPayload + Send,
     F: AsyncFnOnce(U) -> anyhow::Result<T>,
 {
     block_on(async {
-        if let Some(r) = node_from_environment().await? {
-            let NodeResult {
-                node_name,
-                node,
-                initial_port,
-            } = r;
-            PROCESS_NAME.store(&node_name);
-            set_program_name(&format!("{base_name}-{node_name}"));
-            let init = OneshotReceiver::<InitialMessage<U>>::from(initial_port)
-                .await
-                .context("failed to receive initial message")?;
-            let _drop = (
-                f(init.init_message).map(Some),
-                handle_host_requests(init.requests).map(|()| None),
-            )
-                .race()
-                .await
-                .transpose()?;
+        let NodeResult {
+            node_name,
+            node,
+            initial_port,
+        } = node_from_invitation(invitation).await?;
+        PROCESS_NAME.store(&node_name);
+        set_program_name(&format!("{base_name}-{node_name}"));
+        let init = OneshotReceiver::<InitialMessage<U>>::from(initial_port)
+            .await
+            .context("failed to receive initial message")?;
+        let _drop = (
+            f(init.init_message).map(Some),
+            handle_host_requests(init.requests).map(|()| None),
+        )
+            .race()
+            .await
+            .transpose()?;
 
-            tracing::debug!("waiting to shut down node");
-            node.shutdown().await;
-            drop(_drop);
-            std::process::exit(0);
-        }
-        Ok(())
+        tracing::debug!("waiting to shut down node");
+        node.shutdown().await;
+        drop(_drop);
+        std::process::exit(0);
     })
 }
 
@@ -169,56 +329,16 @@ struct NodeResult {
     initial_port: Port,
 }
 
-/// Create an IPC node from an invitation provided via the process environment.
-///
-/// Returns `None` if the invitation is not present in the environment.
-async fn node_from_environment() -> anyhow::Result<Option<NodeResult>> {
-    // return early with no node if the invitation is not present in the environment.
-    let invitation_str = match std::env::var(INVITATION_ENV_NAME) {
-        Ok(str) => str,
-        Err(_) => return Ok(None),
-    };
-
-    // Clear the string to avoid leaking the invitation information into child
-    // processes.
-    //
-    // TODO: this function is unsafe because
-    // it can cause UB if non-Rust code is concurrently accessing the
-    // environment in another thread. To be completely sound,
-    // either this function and its callers need to become
-    // `unsafe`, or we need to avoid using the environment to propagate the
-    // invitation so that we can avoid this call.
-    //
-    // SAFETY: Seems to work so far.
-    unsafe {
-        std::env::remove_var(INVITATION_ENV_NAME);
-    }
-
-    let invitation: Invitation = mesh::payload::decode(
-        &base64::engine::general_purpose::STANDARD
-            .decode(invitation_str)
-            .context("failed to base64 decode invitation")?,
-    )
-    .context("failed to protobuf decode invitation")?;
-
+async fn node_from_invitation(invitation: OwnedInvitation) -> anyhow::Result<NodeResult> {
     let (left, right) = Port::new_pair();
 
     let node;
     #[cfg(windows)]
     {
-        // SAFETY: trusting the initiating process to pass a valid handle. A
-        // malicious process could pass a bad handle here, but a malicious
-        // process could also just corrupt our memory arbitrarily, so...
-        let directory =
-            unsafe { OwnedHandle::from_raw_handle(invitation.directory_handle as RawHandle) };
-
-        let invitation =
-            mesh_remote::windows::AlpcInvitation::new(invitation.credentials, directory);
-
         // join the node w/ the provided invitation and the send port of the channel.
         node = mesh_remote::windows::AlpcNode::join(
             pal_async::windows::TpPool::system(),
-            invitation,
+            invitation.invitation,
             left,
         )
         .context("failed to join mesh")?;
@@ -226,27 +346,72 @@ async fn node_from_environment() -> anyhow::Result<Option<NodeResult>> {
 
     #[cfg(unix)]
     {
-        // SAFETY: trusting the initiating process to pass a valid fd. A
-        // malicious process could pass a bad fd here, but a malicious
-        // process could also just corrupt our memory arbitrarily, so...
-        let fd = unsafe { OwnedFd::from_raw_fd(invitation.socket_fd) };
-        let invitation = mesh_remote::unix::UnixInvitation {
-            address: invitation.address,
-            fd,
-        };
-
         // FUTURE: use pool provided by the caller.
         let (_, driver) = DefaultPool::spawn_on_thread("mesh-worker-pool");
-        node = mesh_remote::unix::UnixNode::join(driver, invitation, left)
+        node = mesh_remote::unix::UnixNode::join(driver, invitation.invitation, left)
             .await
             .context("failed to join mesh")?;
     }
 
-    Ok(Some(NodeResult {
+    Ok(NodeResult {
         node_name: invitation.node_name,
         node,
         initial_port: right,
-    }))
+    })
+}
+
+#[cfg(test)]
+mod invitation_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use test_with_tracing::test;
+
+    #[test]
+    fn capture_claim_is_consumed_once() {
+        let captured = AtomicBool::new(false);
+        claim_invitation(&captured).unwrap();
+        assert!(claim_invitation(&captured).is_err());
+    }
+
+    #[test]
+    fn concurrent_capture_claims_have_one_winner() {
+        let captured = AtomicBool::new(false);
+        let successes = std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| claim_invitation(&captured).is_ok()))
+                .collect();
+            tasks
+                .into_iter()
+                .map(|task| usize::from(task.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(successes, 1);
+        assert!(claim_invitation(&captured).is_err());
+    }
+
+    #[test]
+    fn malformed_invitation_is_not_absence() {
+        let err = decode_invitation("!".into()).err().unwrap();
+        assert_eq!(err.to_string(), "failed to base64 decode invitation");
+        let err = decode_invitation(
+            base64::engine::general_purpose::STANDARD
+                .encode([0xff])
+                .into(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.to_string(), "failed to protobuf decode invitation");
+    }
+
+    #[test]
+    fn non_unicode_invitation_is_not_absence() {
+        #[cfg(unix)]
+        let value = OsString::from_vec(vec![0xff]);
+        #[cfg(windows)]
+        let value = OsString::from_wide(&[0xd800]);
+        let err = decode_invitation(value).err().unwrap();
+        assert_eq!(err.to_string(), "mesh invitation is not Unicode");
+    }
 }
 
 /// Represents a mesh::Node with the ability to spawn new processes that can
@@ -286,6 +451,20 @@ pub trait SandboxProfile: Send {
     /// the pal builder object.
     fn apply(&mut self, builder: &mut ProcessBuilder<'_>);
 
+    /// Configures the child before creation, aborting launch on failure.
+    ///
+    /// Existing profiles retain their infallible behavior. Profiles with
+    /// fallible setup should override this method rather than silently launch
+    /// with only part of their requested confinement.
+    ///
+    /// On Windows, the builder's AppContainer SID is also used to provision
+    /// exact-SID ALPC access before process creation. Any ACL setup failure
+    /// aborts launch rather than falling back to an unrestricted token.
+    fn try_apply(&mut self, builder: &mut ProcessBuilder<'_>) -> anyhow::Result<()> {
+        self.apply(builder);
+        Ok(())
+    }
+
     /// Finalize is intended to execute in the child process context after
     /// application specific initialization is complete. It's optional as not
     /// every sandbox profile will need to perform additional sandboxing.
@@ -301,10 +480,23 @@ pub struct ProcessConfig {
     name: String,
     process_name: Option<PathBuf>,
     process_args: Vec<OsString>,
+    stdout: Option<File>,
     stderr: Option<File>,
     skip_worker_arg: bool,
     sandbox_profile: Option<Box<dyn SandboxProfile + Sync>>,
     env_vars: Vec<(OsString, OsString)>,
+    #[cfg(windows)]
+    app_container_peers: Vec<pal::windows::security::MaximumSid>,
+    #[cfg(windows)]
+    peer_endpoint_mode: PeerEndpointMode,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerEndpointMode {
+    AppContainer,
+    TrustedHost,
+    Conflicting,
 }
 
 impl ProcessConfig {
@@ -315,10 +507,15 @@ impl ProcessConfig {
             name: name.into(),
             process_name: None,
             process_args: Vec::new(),
+            stdout: None,
             stderr: None,
             skip_worker_arg: false,
             sandbox_profile: None,
             env_vars: Vec::new(),
+            #[cfg(windows)]
+            app_container_peers: Vec::new(),
+            #[cfg(windows)]
+            peer_endpoint_mode: PeerEndpointMode::AppContainer,
         }
     }
 
@@ -332,10 +529,15 @@ impl ProcessConfig {
             name: name.into(),
             process_name: None,
             process_args: Vec::new(),
+            stdout: None,
             stderr: None,
             skip_worker_arg: false,
             sandbox_profile: Some(sandbox_profile),
             env_vars: Vec::new(),
+            #[cfg(windows)]
+            app_container_peers: Vec::new(),
+            #[cfg(windows)]
+            peer_endpoint_mode: PeerEndpointMode::AppContainer,
         }
     }
 
@@ -367,6 +569,9 @@ impl ProcessConfig {
     }
 
     /// Adds environment variables when launching the process.
+    ///
+    /// Launch fails if these override the reserved `MESH_WORKER_INVITATION`
+    /// variable, whose resource ownership is established by Mesh.
     pub fn env<I>(mut self, env_vars: I) -> Self
     where
         I: IntoIterator,
@@ -376,10 +581,95 @@ impl ProcessConfig {
         self
     }
 
+    /// Sets the process's stdout to `file`, or the null device if `None`.
+    pub fn stdout(mut self, file: Option<File>) -> Self {
+        self.stdout = file;
+        self
+    }
+
     /// Sets the process's stderr to `file`.
     pub fn stderr(mut self, file: Option<File>) -> Self {
         self.stderr = file;
         self
+    }
+
+    /// Adds an exact AppContainer peer allowed to connect to this child's Mesh
+    /// endpoint. The SID is copied; repeated identities are deduplicated.
+    ///
+    /// The trusted parent configures reciprocal grants before launch. For a
+    /// star, add every spoke SID to the hub, but only the hub SID to each spoke.
+    /// No peers are inferred from other invitations. All supplied SIDs are
+    /// validated before invitation setup; broad package-group SIDs and the
+    /// child's own identity are rejected. Launch also fails if the sandbox
+    /// profile does not configure an AppContainer. Do not combine this method
+    /// with [`Self::trusted_host_app_container_peer`].
+    ///
+    /// Before the first launch, the trusted caller must prepare the whole
+    /// topology and retain owned registered profiles for each logical worker in
+    /// one fresh sandbox lifetime. Concurrently isolated workers require
+    /// distinct SIDs. The invitation carries only transient, private ACL
+    /// metadata in an immutable launch-time snapshot, not profile ownership.
+    /// There is no post-launch grant or revocation API.
+    ///
+    /// Reuse a retained profile for a replacement generation only after its old
+    /// root is reaped and its old job is empty. Fresh sandbox reconstruction
+    /// requires new owned profiles and SIDs. Serialized SID text, names, or
+    /// digests cannot recreate ownership; never share profiles between
+    /// independent sandbox lifetimes.
+    #[cfg(windows)]
+    pub fn app_container_peer(mut self, sid: &pal::windows::security::Sid) -> Self {
+        self.add_app_container_peer(sid, PeerEndpointMode::AppContainer);
+        self
+    }
+
+    /// Explicitly permits an exact AppContainer peer to connect to a trusted
+    /// ordinary-user child's Mesh endpoint.
+    ///
+    /// This selects a trusted-host endpoint, not an AppContainer fallback.
+    /// The caller must separately authorize trusting this child, which must
+    /// run as the current user without an AppContainer. This method does not
+    /// change its token, privileges, Job limits, or hypervisor permissions.
+    /// A configured AppContainer or mixing this method with
+    /// [`Self::app_container_peer`] rejects launch.
+    ///
+    /// SIDs are copied, appended, deduplicated, and validated before invitation
+    /// setup. The child endpoint grants only PORT_CONNECT to these exact SIDs,
+    /// with a low-integrity label; no synthetic identity is assigned to the
+    /// child. Peers must join this mesh through their own AppContainer
+    /// invitations, which establish their directory access. This method does
+    /// not grant peers access to the parent's endpoint or directory.
+    ///
+    /// The current-user grant already on each confined peer's endpoint allows
+    /// the reverse connection from this trusted host. Peer profile ownership,
+    /// lifetime and replacement requirements are as for
+    /// [`Self::app_container_peer`].
+    #[cfg(windows)]
+    pub fn trusted_host_app_container_peer(mut self, sid: &pal::windows::security::Sid) -> Self {
+        self.add_app_container_peer(sid, PeerEndpointMode::TrustedHost);
+        self
+    }
+
+    #[cfg(windows)]
+    fn add_app_container_peer(
+        &mut self,
+        sid: &pal::windows::security::Sid,
+        mode: PeerEndpointMode,
+    ) {
+        self.peer_endpoint_mode =
+            if !self.app_container_peers.is_empty() && self.peer_endpoint_mode != mode {
+                PeerEndpointMode::Conflicting
+            } else {
+                mode
+            };
+        let text = sid.to_string_sid();
+        if !self
+            .app_container_peers
+            .iter()
+            .any(|peer| peer.to_string_sid() == text)
+        {
+            self.app_container_peers
+                .push(pal::windows::security::MaximumSid::from(sid));
+        }
     }
 }
 
@@ -410,7 +700,7 @@ struct MeshHostInner {
 }
 
 enum MeshRequest {
-    NewHost(FailableRpc<NewHostParams, i32>),
+    NewHost(FailableRpc<Box<NewHostParams>, LaunchedHost>),
     Listen(FailableRpc<ListenParams, Task<()>>),
     Inspect(inspect::Deferred),
     Crash(i32),
@@ -425,6 +715,19 @@ struct NewHostParams {
     config: ProcessConfig,
     recv: Port,
     request_send: mesh::Sender<HostRequest>,
+    owned: bool,
+    #[cfg(any(windows, target_os = "linux"))]
+    launch: Option<pending_host::LaunchGuard>,
+    #[cfg(all(test, any(windows, target_os = "linux")))]
+    test_hooks: Option<pending_host::LaunchTestHooks>,
+}
+
+enum LaunchedHost {
+    Legacy(i32),
+    #[cfg(any(windows, target_os = "linux"))]
+    Owned(OwnedHost),
+    #[cfg(any(windows, target_os = "linux"))]
+    Pending,
 }
 
 impl Mesh {
@@ -493,6 +796,100 @@ impl Mesh {
         config: ProcessConfig,
         initial_message: T,
     ) -> anyhow::Result<i32> {
+        match self
+            .launch_host_inner(config, initial_message, false)
+            .await?
+        {
+            LaunchedHost::Legacy(pid) => Ok(pid),
+            #[cfg(any(windows, target_os = "linux"))]
+            LaunchedHost::Owned(_) | LaunchedHost::Pending => {
+                unreachable!("requested legacy launch")
+            }
+        }
+    }
+
+    /// Launches a root process and returns exclusive OS lifecycle ownership.
+    ///
+    /// Returns after OS creation, before the child joins Mesh or acknowledges
+    /// readiness. This permits rollback even when child startup blocks. Dropping
+    /// the result requests termination; [`OwnedHost::wait_root`] proves root OS
+    /// exit/reap, not descendant cleanup. Cancellation of the launch future also
+    /// requests cancellation. Use [`Self::begin_launch_host_owned`] to retain
+    /// completion evidence after cancelling launch or receiving an error.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub async fn launch_host_owned<T: 'static + MeshField + Send>(
+        &self,
+        config: ProcessConfig,
+        initial_message: T,
+    ) -> anyhow::Result<OwnedHost> {
+        self.begin_launch_host_owned(config, initial_message)
+            .wait_host()
+            .await
+    }
+
+    /// Starts an owned launch and returns its cancellation/completion receipt.
+    ///
+    /// The receipt is established before dispatch. Keep it across deadlines
+    /// and errors, request cancellation, and observe its root completion before
+    /// releasing prepared resources. Domain-empty evidence is separate.
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn begin_launch_host_owned<T: 'static + MeshField + Send>(
+        &self,
+        config: ProcessConfig,
+        initial_message: T,
+    ) -> PendingHostLaunch {
+        self.begin_owned(
+            config,
+            initial_message,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn begin_owned<T: 'static + MeshField + Send>(
+        &self,
+        config: ProcessConfig,
+        initial_message: T,
+        #[cfg(test)] test_hooks: Option<pending_host::LaunchTestHooks>,
+    ) -> PendingHostLaunch {
+        let (mut pending, launch) = PendingHostLaunch::new();
+        let (request_send, request_recv) = mesh::channel();
+        let (init_send, init_recv) = mesh::oneshot::<InitialMessage<T>>();
+        init_send.send(InitialMessage {
+            requests: request_recv,
+            init_message: initial_message,
+        });
+        let result = self.request.call_failable(
+            MeshRequest::NewHost,
+            Box::new(NewHostParams {
+                config,
+                recv: init_recv.into(),
+                request_send,
+                owned: true,
+                launch: Some(launch),
+                #[cfg(test)]
+                test_hooks,
+            }),
+        );
+        pending.set_result(
+            async move {
+                match result.await.context("failed to launch new host")? {
+                    LaunchedHost::Pending => Ok(()),
+                    _ => anyhow::bail!("owned launch returned an unexpected handoff"),
+                }
+            }
+            .boxed(),
+        );
+        pending
+    }
+
+    async fn launch_host_inner<T: 'static + MeshField + Send>(
+        &self,
+        config: ProcessConfig,
+        initial_message: T,
+        owned: bool,
+    ) -> anyhow::Result<LaunchedHost> {
         let (request_send, request_recv) = mesh::channel();
 
         let (init_send, init_recv) = mesh::oneshot::<InitialMessage<T>>();
@@ -504,11 +901,16 @@ impl Mesh {
         self.request
             .call_failable(
                 MeshRequest::NewHost,
-                NewHostParams {
+                Box::new(NewHostParams {
                     config,
                     recv: init_recv.into(),
                     request_send,
-                },
+                    owned,
+                    #[cfg(any(windows, target_os = "linux"))]
+                    launch: None,
+                    #[cfg(all(test, any(windows, target_os = "linux")))]
+                    test_hooks: None,
+                }),
             )
             .await
             .context("failed to launch new host")
@@ -517,6 +919,9 @@ impl Mesh {
     /// Shutdown the mesh and wait for any spawned processes to exit.
     ///
     /// The `Mesh` instance is no longer usable after `shutdown`.
+    /// This does not force processes to exit. In particular, if an owned root
+    /// cannot be terminated, this wait can remain pending indefinitely. Observe
+    /// each owned root's exit result before treating cleanup as successful.
     pub async fn shutdown(self) {
         let span = tracing::span!(
             tracing::Level::INFO,
@@ -681,7 +1086,7 @@ impl MeshInner {
             match event {
                 Event::Request(request) => match request {
                     MeshRequest::NewHost(rpc) => {
-                        rpc.handle_failable(async |params| self.spawn_process(params).await)
+                        rpc.handle_failable(async |params| self.launch_request(*params).await)
                             .await
                     }
                     MeshRequest::Listen(rpc) => {
@@ -813,14 +1218,104 @@ impl MeshInner {
         pal::windows::fs::is_unix_socket(path)
     }
 
+    async fn launch_request(&mut self, params: NewHostParams) -> anyhow::Result<LaunchedHost> {
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            self.spawn_process(params).await
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let mut params = params;
+            let launch = params.launch.take();
+            #[cfg(test)]
+            let mut hooks = params.test_hooks.take();
+            #[cfg(test)]
+            if let Some(launch) = &launch {
+                launch.set_native_gate(hooks.as_mut().and_then(|hooks| hooks.native_entry.take()));
+            }
+            let result = async {
+                if let Some(launch) = &launch {
+                    launch.check_cancelled()?;
+                }
+                #[cfg(test)]
+                if let Some((entered, resume)) =
+                    hooks.as_mut().and_then(|hooks| hooks.before_spawn.take())
+                {
+                    entered.send(());
+                    resume.await.context("pre-spawn test gate closed")?;
+                }
+                if let Some(launch) = &launch {
+                    launch.check_cancelled()?;
+                }
+                match self.spawn_process(params, launch.as_ref()).await? {
+                    LaunchedHost::Owned(host) => {
+                        launch
+                            .as_ref()
+                            .expect("owned launches carry a receipt")
+                            .publish(host)?;
+                        #[cfg(test)]
+                        {
+                            if let Some((entered, resume)) =
+                                hooks.as_mut().and_then(|hooks| hooks.before_handoff.take())
+                            {
+                                entered.send(());
+                                resume.await.context("pre-handoff test gate closed")?;
+                            }
+                            if hooks.is_some_and(|hooks| hooks.fail_before_handoff) {
+                                anyhow::bail!("injected pre-handoff failure");
+                            }
+                        }
+                        Ok(LaunchedHost::Pending)
+                    }
+                    result => Ok(result),
+                }
+            }
+            .await;
+            if let Some(launch) = launch {
+                launch.finish(result.is_ok());
+            }
+            result
+        }
+    }
+
     /// Spawns a new process with a mesh channel associated with this `Mesh` instance.
-    #[instrument(name = "mesh_spawn_process", skip(self, params), fields(mesh_name = self.mesh_name.as_str(), pid = tracing::field::Empty))]
-    async fn spawn_process(&mut self, params: NewHostParams) -> anyhow::Result<i32> {
+    #[instrument(name = "mesh_spawn_process", skip_all, fields(mesh_name = self.mesh_name.as_str(), pid = tracing::field::Empty))]
+    async fn spawn_process(
+        &mut self,
+        params: NewHostParams,
+        #[cfg(any(windows, target_os = "linux"))] launch: Option<&pending_host::LaunchGuard>,
+    ) -> anyhow::Result<LaunchedHost> {
         let NewHostParams {
             config,
             recv,
             request_send,
+            owned,
+            #[cfg(any(windows, target_os = "linux"))]
+                launch: _,
+            #[cfg(all(test, any(windows, target_os = "linux")))]
+                test_hooks: _,
         } = params;
+        anyhow::ensure!(
+            !config.env_vars.iter().any(|(key, _)| {
+                let key = key.as_encoded_bytes();
+                let end = key
+                    .iter()
+                    .position(|&byte| byte == b'=')
+                    .unwrap_or(key.len());
+                let key = &key[..end];
+                #[cfg(windows)]
+                {
+                    key.eq_ignore_ascii_case(INVITATION_ENV_NAME.as_bytes())
+                }
+                #[cfg(unix)]
+                {
+                    key == INVITATION_ENV_NAME.as_bytes()
+                }
+            }),
+            "process configuration must not override the Mesh invitation"
+        );
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = owned;
 
         let pid;
         let node_id;
@@ -841,18 +1336,15 @@ impl MeshInner {
 
         #[cfg(windows)]
         let child = {
-            let (invitation, handle) = self.node.invite(recv).context("mesh node invite error")?;
-            node_id = invitation.node_id();
-            let (credentials, directory) = invitation.into_parts();
-
-            let invitation_env = base64::engine::general_purpose::STANDARD.encode(
-                mesh::payload::encode(Invitation {
-                    node_name: name.clone(),
-                    credentials,
-                    directory_handle: directory.as_raw_handle() as usize,
-                }),
-            );
-
+            let host_job = if owned {
+                let job =
+                    pal::windows::job::Job::new().context("failed to create owned host job")?;
+                job.set_terminate_on_close()
+                    .context("failed to set owned host job terminate on close")?;
+                Some(job)
+            } else {
+                None
+            };
             let mut args = config.process_args;
             if !config.skip_worker_arg {
                 args.push(name.clone().into());
@@ -869,23 +1361,100 @@ impl MeshInner {
             builder
                 .stdin(process::Stdio::Null)
                 .stdout(process::Stdio::Null)
-                .handle(&directory)
-                .env(INVITATION_ENV_NAME, invitation_env)
-                .extend_env(config.env_vars)
-                .job(self.job.as_handle());
+                .extend_env(config.env_vars);
+            if let Some(job) = &host_job {
+                builder.job(job.as_handle());
+            } else {
+                builder.job(self.job.as_handle());
+            }
 
+            if let Some(log_file) = config.stdout.as_ref() {
+                builder.stdout(process::Stdio::Handle(log_file.as_handle()));
+            }
             if let Some(log_file) = config.stderr.as_ref() {
                 builder.stderr(process::Stdio::Handle(log_file.as_handle()));
             }
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut builder);
+                sandbox_profile
+                    .try_apply(&mut builder)
+                    .context("failed to apply mesh sandbox profile")?;
             }
+
+            let (invitation, handle) = match (
+                builder.app_container_sid(),
+                config.app_container_peers.as_slice(),
+                config.peer_endpoint_mode,
+            ) {
+                (_, _, PeerEndpointMode::Conflicting) => {
+                    anyhow::bail!("trusted-host and AppContainer peer modes cannot be combined")
+                }
+                (Some(_), _, PeerEndpointMode::TrustedHost) => {
+                    anyhow::bail!("trusted-host peer endpoint must not configure an AppContainer")
+                }
+                (Some(sid), peers, PeerEndpointMode::AppContainer) => {
+                    self.node.invite_app_container_with_peers(recv, sid, peers)
+                }
+                (None, peers, PeerEndpointMode::TrustedHost) => {
+                    self.node.invite_with_app_container_peers(recv, peers)
+                }
+                (None, [], PeerEndpointMode::AppContainer) => self.node.invite(recv),
+                (None, _, PeerEndpointMode::AppContainer) => {
+                    anyhow::bail!("AppContainer peer requires an AppContainer sandbox profile")
+                }
+            }
+            .context("mesh node invite error")?;
+            node_id = invitation.node_id();
+            let (credentials, directory) = invitation.into_parts();
+            let invitation_env = base64::engine::general_purpose::STANDARD.encode(
+                mesh::payload::encode(Invitation {
+                    node_name: name.clone(),
+                    credentials,
+                    directory_handle: directory.as_raw_handle() as usize,
+                }),
+            );
+            builder
+                .handle(&directory)
+                .env(INVITATION_ENV_NAME, invitation_env);
 
             // Launch the child process on a separate thread to isolate
             // the CreateProcess call from other IO pools.
-            let child = std::thread::scope(|s| s.spawn(|| builder.spawn()).join().unwrap())
-                .context("failed to launch mesh process")?;
+            let prepared = owned
+                .then(owned_host::PreparedRoot::new)
+                .transpose()
+                .context("failed to reserve root reaper")?;
+            let result = std::thread::scope(|scope| {
+                let thread = std::thread::Builder::new().spawn_scoped(scope, || {
+                    if let Some(launch) = launch {
+                        launch.enter_native()?;
+                    }
+                    builder.spawn()
+                })?;
+                thread
+                    .join()
+                    .map_err(|_| std::io::Error::other("mesh native creation thread panicked"))
+            })
+            .context("failed to run native creation thread")?;
+            let child = match result {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(launch) = launch {
+                        launch.no_root();
+                    }
+                    return Err(error).context("failed to launch mesh process");
+                }
+            };
+            if let Some(job) = host_job {
+                let prepared = prepared.expect("owned launch reserved a reaper");
+                launch
+                    .expect("owned launch has a receipt")
+                    .observe_root(prepared.exit());
+                let host = prepared
+                    .finish(child, job)
+                    .context("failed to own mesh root")?;
+                self.track_owned_host(&host, name, node_id, request_send, handle);
+                return Ok(LaunchedHost::Owned(host));
+            }
             // Wait for the child to connect to the mesh. TODO: timeout
             handle.await;
             pid = child.id() as i32;
@@ -933,18 +1502,74 @@ impl MeshInner {
                 command.arg(&name);
             }
 
+            if let Some(log_file) = config.stdout.as_ref() {
+                command.stdout(process::Stdio::Fd(log_file.as_fd()));
+            }
             if let Some(log_file) = config.stderr.as_ref() {
                 command.stderr(process::Stdio::Fd(log_file.as_fd()));
             }
 
             if let Some(mut sandbox_profile) = config.sandbox_profile {
-                sandbox_profile.apply(&mut command);
+                sandbox_profile
+                    .try_apply(&mut command)
+                    .context("failed to apply mesh sandbox profile")?;
             }
 
             // Launch the child process on a separate thread to isolate
             // the fork() call from other IO pools.
-            let child = std::thread::scope(|s| s.spawn(|| command.spawn()).join().unwrap())
-                .context("failed to launch mesh process")?;
+            #[cfg(target_os = "linux")]
+            let prepared = owned
+                .then(owned_host::PreparedRoot::new)
+                .transpose()
+                .context("failed to reserve root reaper")?;
+            let result = std::thread::scope(|scope| {
+                let thread = std::thread::Builder::new().spawn_scoped(scope, || {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(launch) = launch {
+                            launch.enter_native().map_err(|error| (error, None))?;
+                        }
+                        if owned {
+                            return command
+                                .spawn_captured()
+                                .map_err(process::SpawnError::into_parts);
+                        }
+                    }
+                    command.spawn().map_err(|error| (error, None))
+                })?;
+                thread
+                    .join()
+                    .map_err(|_| std::io::Error::other("mesh native creation thread panicked"))
+            })
+            .context("failed to run native creation thread")?;
+            let child = match result {
+                Ok(child) => child,
+                Err((error, failed_child)) => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(launch) = launch {
+                        if let Some(child) = failed_child {
+                            let prepared = prepared.expect("owned launch reserved a reaper");
+                            launch.observe_root(prepared.exit());
+                            prepared.reap(child, true);
+                        } else {
+                            launch.no_root();
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _: Option<process::Child> = failed_child;
+                    return Err(error).context("failed to launch mesh process");
+                }
+            };
+            #[cfg(target_os = "linux")]
+            if owned {
+                let prepared = prepared.expect("owned launch reserved a reaper");
+                launch
+                    .expect("owned launch has a receipt")
+                    .observe_root(prepared.exit());
+                let host = prepared.finish(child).context("failed to own mesh root")?;
+                self.track_owned_host(&host, name, node_id, request_send);
+                return Ok(LaunchedHost::Owned(host));
+            }
             pid = child.id();
             tracing::Span::current().record("pid", pid);
 
@@ -967,7 +1592,41 @@ impl MeshInner {
             });
 
         self.waiters.push(task);
-        Ok(pid)
+        Ok(LaunchedHost::Legacy(pid))
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn track_owned_host(
+        &mut self,
+        host: &OwnedHost,
+        name: String,
+        node_id: mesh::NodeId,
+        send: mesh::Sender<HostRequest>,
+        #[cfg(windows)] invitation: mesh_remote::windows::AlpcInvitationHandle,
+    ) {
+        let pid = host.id();
+        tracing::Span::current().record("pid", pid);
+        let id = self.hosts.insert(MeshHostInner {
+            name,
+            pid,
+            node_id,
+            send,
+        });
+        let exit = host.exit();
+        self.waiters.push(self.node_driver.spawn(
+            format!("wait-owned-mesh-child-{pid}"),
+            async move {
+                // Keep the invitation valid until the child joins or exits;
+                // never wait for a handshake before returning launch ownership.
+                #[cfg(windows)]
+                let _invitation = invitation;
+                match exit.await {
+                    Ok(status) => tracing::info!(pid, ?status, "owned mesh root exited"),
+                    Err(error) => tracing::error!(pid, %error, "owned mesh root wait failed"),
+                }
+                id
+            },
+        ));
     }
 }
 
@@ -1022,6 +1681,313 @@ mod tests {
     use pal_async::async_test;
     use pal_async::task::Spawn;
     use test_with_tracing::test;
+
+    #[test]
+    fn sandbox_profile_try_apply_preserves_legacy_apply() {
+        struct Profile(bool);
+        impl SandboxProfile for Profile {
+            fn apply(&mut self, _: &mut ProcessBuilder<'_>) {
+                self.0 = true;
+            }
+        }
+
+        let mut profile = Profile(false);
+        profile
+            .try_apply(&mut ProcessBuilder::new("unused"))
+            .unwrap();
+        assert!(profile.0);
+    }
+
+    #[async_test]
+    async fn sandbox_profile_failure_prevents_spawn(_driver: DefaultDriver) {
+        struct Profile;
+        impl SandboxProfile for Profile {
+            fn apply(&mut self, _: &mut ProcessBuilder<'_>) {
+                panic!("fallible profiles must not fall back to apply");
+            }
+
+            fn try_apply(&mut self, _: &mut ProcessBuilder<'_>) -> anyhow::Result<()> {
+                anyhow::bail!("test profile setup failed")
+            }
+        }
+
+        let mesh = Mesh::new("profile-failure".into()).unwrap();
+        let config = || {
+            ProcessConfig::new_with_sandbox("profile-failure", Box::new(Profile))
+                .process_name("nonexistent-mesh-profile-test-executable")
+        };
+        let error = mesh.launch_host(config(), ()).await.err().unwrap();
+        assert!(
+            format!("{error:#}").contains("test profile setup failed"),
+            "{error:#}"
+        );
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let error = mesh.launch_host_owned(config(), ()).await.err().unwrap();
+            assert!(
+                format!("{error:#}").contains("test profile setup failed"),
+                "{error:#}"
+            );
+        }
+        mesh.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn sandbox_profile_app_container_rejects_broad_sid(_driver: DefaultDriver) {
+        struct Profile;
+        impl SandboxProfile for Profile {
+            fn apply(&mut self, builder: &mut ProcessBuilder<'_>) {
+                let sid = pal::windows::security::Sid::new([0, 0, 0, 0, 0, 15], [2, 1]);
+                builder.app_container(sid.as_ref());
+            }
+        }
+
+        let mesh = Mesh::new("app-container-rejection".into()).unwrap();
+        let config = || {
+            ProcessConfig::new_with_sandbox("app-container-rejection", Box::new(Profile))
+                .process_name("nonexistent-mesh-profile-test-executable")
+        };
+        let error = mesh.launch_host(config(), ()).await.err().unwrap();
+        assert!(
+            format!("{error:#}").contains("expected a unique package SID"),
+            "{error:#}"
+        );
+        let error = mesh.launch_host_owned(config(), ()).await.err().unwrap();
+        assert!(
+            format!("{error:#}").contains("expected a unique package SID"),
+            "{error:#}"
+        );
+        mesh.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn app_container_peers_are_owned_appended_and_deduplicated() {
+        use pal::windows::security::MaximumSid;
+
+        let mut config = ProcessConfig::new("star");
+        let identities = ["S-1-15-2-1-2-3-4-5-6-7", "S-1-15-2-8-9-10-11-12-13-14"];
+        for text in identities.into_iter().chain(identities) {
+            {
+                let sid: MaximumSid = text.parse().unwrap();
+                config = config.app_container_peer(sid.as_ref());
+            }
+        }
+        assert_eq!(
+            config
+                .app_container_peers
+                .iter()
+                .map(|sid| sid.to_string_sid())
+                .collect::<Vec<_>>(),
+            identities
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_host_peers_are_owned_appended_and_deduplicated() {
+        use pal::windows::security::MaximumSid;
+
+        let mut config = ProcessConfig::new("trusted-host");
+        let identities = ["S-1-15-2-1-2-3-4-5-6-7", "S-1-15-2-8-9-10-11-12-13-14"];
+        for text in identities.into_iter().chain(identities) {
+            let sid: MaximumSid = text.parse().unwrap();
+            config = config.trusted_host_app_container_peer(sid.as_ref());
+        }
+        assert!(matches!(
+            config.peer_endpoint_mode,
+            PeerEndpointMode::TrustedHost
+        ));
+        assert_eq!(
+            config
+                .app_container_peers
+                .iter()
+                .map(|sid| sid.to_string_sid())
+                .collect::<Vec<_>>(),
+            identities
+        );
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn trusted_host_peer_launch_does_not_require_app_container(driver: DefaultDriver) {
+        use owned_host::tests::{bounded, config, ready};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trusted-host");
+        let sid: pal::windows::security::MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let mesh = Mesh::new("trusted-peer-launch".into()).unwrap();
+        let mut host = bounded(
+            &driver,
+            mesh.launch_host_owned(
+                config(&path).trusted_host_app_container_peer(sid.as_ref()),
+                (),
+            ),
+        )
+        .await
+        .unwrap();
+        ready(&driver, &path).await;
+        host.terminate_root().unwrap();
+        bounded(&driver, host.wait_root()).await.unwrap();
+        bounded(&driver, mesh.shutdown()).await;
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn trusted_host_peer_rejects_invalid_sid_before_spawn(driver: DefaultDriver) {
+        use owned_host::tests::bounded;
+        use pal::windows::security::MaximumSid;
+
+        let valid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let mesh = Mesh::new("trusted-invalid-peer".into()).unwrap();
+        for invalid in [
+            "S-1-1-0",
+            "S-1-15-2-1",
+            "S-1-15-2-1-2-3",
+            "S-1-15-3-1-2-3-4-5-6-7",
+        ] {
+            let invalid: MaximumSid = invalid.parse().unwrap();
+            let config = || {
+                ProcessConfig::new("trusted-invalid-peer")
+                    .process_name("nonexistent-mesh-profile-test-executable")
+                    .trusted_host_app_container_peer(valid.as_ref())
+                    .trusted_host_app_container_peer(invalid.as_ref())
+            };
+            let error = bounded(&driver, mesh.launch_host(config(), ()))
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                format!("{error:#}").contains("expected a unique package SID"),
+                "{error:#}"
+            );
+            let mut pending = mesh.begin_launch_host_owned(config(), ());
+            let error = bounded(&driver, pending.wait_host()).await.err().unwrap();
+            assert!(
+                format!("{error:#}").contains("expected a unique package SID"),
+                "{error:#}"
+            );
+            assert_eq!(
+                bounded(&driver, pending.wait_completion()).await.unwrap(),
+                LaunchCompletion::NeverSpawned
+            );
+        }
+        bounded(&driver, mesh.shutdown()).await;
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn trusted_host_peer_rejects_conflicting_modes_before_spawn(driver: DefaultDriver) {
+        use owned_host::tests::bounded;
+        use pal::windows::security::MaximumSid;
+
+        struct Profile;
+        impl SandboxProfile for Profile {
+            fn apply(&mut self, builder: &mut ProcessBuilder<'_>) {
+                let sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+                builder.app_container(sid.as_ref());
+            }
+        }
+        let sid: MaximumSid = "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap();
+        let mesh = Mesh::new("trusted-peer-conflict".into()).unwrap();
+        for mode in 0..3 {
+            let config = || {
+                let config = if mode == 2 {
+                    ProcessConfig::new_with_sandbox("trusted-peer-conflict", Box::new(Profile))
+                } else {
+                    ProcessConfig::new("trusted-peer-conflict")
+                }
+                .process_name("nonexistent-mesh-profile-test-executable");
+                match mode {
+                    0 => config
+                        .app_container_peer(sid.as_ref())
+                        .trusted_host_app_container_peer(sid.as_ref())
+                        .app_container_peer(sid.as_ref()),
+                    1 => config
+                        .trusted_host_app_container_peer(sid.as_ref())
+                        .app_container_peer(sid.as_ref())
+                        .trusted_host_app_container_peer(sid.as_ref()),
+                    _ => config.trusted_host_app_container_peer(sid.as_ref()),
+                }
+            };
+            let expected = if mode == 2 {
+                "trusted-host peer endpoint must not configure an AppContainer"
+            } else {
+                "trusted-host and AppContainer peer modes cannot be combined"
+            };
+            let error = bounded(&driver, mesh.launch_host(config(), ()))
+                .await
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            let mut pending = mesh.begin_launch_host_owned(config(), ());
+            let error = bounded(&driver, pending.wait_host()).await.err().unwrap();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(
+                bounded(&driver, pending.wait_completion()).await.unwrap(),
+                LaunchCompletion::NeverSpawned
+            );
+        }
+        bounded(&driver, mesh.shutdown()).await;
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn app_container_peer_requires_profile(_driver: DefaultDriver) {
+        let sid: pal::windows::security::MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+        let mesh = Mesh::new("peer-without-profile".into()).unwrap();
+        let config = || {
+            ProcessConfig::new("peer-without-profile")
+                .app_container_peer(sid.as_ref())
+                .process_name("nonexistent-mesh-profile-test-executable")
+        };
+        for error in [
+            mesh.launch_host(config(), ()).await.err().unwrap(),
+            mesh.launch_host_owned(config(), ()).await.err().unwrap(),
+        ] {
+            assert!(
+                format!("{error:#}")
+                    .contains("AppContainer peer requires an AppContainer sandbox profile"),
+                "{error:#}"
+            );
+        }
+        mesh.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[async_test]
+    async fn app_container_peer_list_rejects_broad_before_spawn(_driver: DefaultDriver) {
+        use pal::windows::security::MaximumSid;
+
+        struct Profile;
+        impl SandboxProfile for Profile {
+            fn apply(&mut self, builder: &mut ProcessBuilder<'_>) {
+                let sid: MaximumSid = "S-1-15-2-1-2-3-4-5-6-7".parse().unwrap();
+                builder.app_container(sid.as_ref());
+            }
+        }
+
+        let valid: MaximumSid = "S-1-15-2-8-9-10-11-12-13-14".parse().unwrap();
+        let broad: MaximumSid = "S-1-15-2-1".parse().unwrap();
+        let mesh = Mesh::new("invalid-peer-list".into()).unwrap();
+        let config = || {
+            ProcessConfig::new_with_sandbox("invalid-peer-list", Box::new(Profile))
+                .app_container_peer(valid.as_ref())
+                .app_container_peer(broad.as_ref())
+                .process_name("nonexistent-mesh-profile-test-executable")
+        };
+        for error in [
+            mesh.launch_host(config(), ()).await.err().unwrap(),
+            mesh.launch_host_owned(config(), ()).await.err().unwrap(),
+        ] {
+            assert!(
+                format!("{error:#}").contains("expected a unique package SID"),
+                "{error:#}"
+            );
+        }
+        mesh.shutdown().await;
+    }
 
     #[async_test]
     async fn test_listen(driver: DefaultDriver) {

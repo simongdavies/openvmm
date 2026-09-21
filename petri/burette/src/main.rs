@@ -182,17 +182,22 @@ struct PackageArgs {
     no_strip: bool,
 }
 
+// UNSAFETY: Captures the inherited mesh invitation before starting threads.
+#[expect(unsafe_code)]
 fn main() -> anyhow::Result<()> {
+    // SAFETY: startup is single-threaded and has not adopted any inherited mesh
+    // resource. Invitations are supplied by our trusted mesh launcher.
+    let invitation = unsafe { mesh_process::OwnedInvitation::capture_from_environment() }?;
     // Check for helper subprocess modes before any threads spawn.
     // The TAP helper must call unshare(CLONE_NEWUSER) while single-threaded.
     match std::env::args().nth(1).as_deref() {
         Some("iperf-helper") => {
-            iperf_helper::run_helper();
+            iperf_helper::run_helper(invitation);
             return Ok(());
         }
         #[cfg(target_os = "linux")]
         Some("tap-ns-helper") => {
-            iperf_helper::linux::run_tap_helper();
+            iperf_helper::linux::run_tap_helper(invitation);
             return Ok(());
         }
         _ => {}
