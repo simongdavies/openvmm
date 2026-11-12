@@ -1,9 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Linux process launching support.
+//! Unix process launching support.
 
 #![warn(missing_docs)]
+#![cfg_attr(
+    target_os = "macos",
+    expect(
+        clippy::disallowed_types,
+        reason = "PAL uses std's reap lock without adding a macOS dependency"
+    )
+)]
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -19,8 +26,9 @@ use std::io;
 use std::os::unix::prelude::*;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 
 #[cfg(target_os = "linux")]
 use caps::CapsHashSet;
@@ -564,6 +572,8 @@ pub struct Child {
     pid: i32,
     #[cfg(target_os = "linux")]
     pidfd: OwnedFd,
+    #[cfg(target_os = "macos")]
+    identity: Arc<Mutex<Option<i32>>>,
     status: Option<ExitStatus>,
 }
 
@@ -584,6 +594,20 @@ impl Child {
         Ok(ProcessHandle(self.pidfd.try_clone()?))
     }
 
+    /// Terminates the original unreaped child under its reap lock.
+    #[cfg(target_os = "macos")]
+    pub fn kill(&self) -> io::Result<()> {
+        self.termination_handle()?.kill()
+    }
+
+    /// Retains termination authority until this child is reaped.
+    ///
+    /// The caller must not reap this child outside its wait methods.
+    #[cfg(target_os = "macos")]
+    pub fn termination_handle(&self) -> io::Result<ProcessHandle> {
+        Ok(ProcessHandle(self.identity.clone()))
+    }
+
     /// Synchronously waits for the child process to exit.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         self.wait_internal(0).transpose().unwrap()
@@ -599,6 +623,28 @@ impl Child {
             return Ok(self.status);
         }
 
+        #[cfg(target_os = "macos")]
+        if options & libc::WNOHANG == 0 {
+            // Observe exit without reaping, so termination can still acquire the lock.
+            // SAFETY: info is writable and the owned child remains unreaped.
+            unsafe {
+                let mut info = std::mem::zeroed();
+                while_eintr(|| {
+                    libc::waitid(
+                        libc::P_PID,
+                        self.pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                    .syscall_result()
+                })?;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        let mut identity = self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut status = 0;
         // SAFETY: calling as documented.
         let n = unsafe {
@@ -606,6 +652,10 @@ impl Child {
         };
         if n != 0 {
             self.status = Some(ExitStatus::from_raw(status));
+            #[cfg(target_os = "macos")]
+            {
+                *identity = None;
+            }
         }
         Ok(self.status)
     }
@@ -619,6 +669,23 @@ impl Child {
 /// Stable Linux process identity. This does not own or contain descendants.
 #[cfg(target_os = "linux")]
 pub struct ProcessHandle(OwnedFd);
+
+/// Termination authority synchronized with the original child's reaper.
+#[cfg(target_os = "macos")]
+pub struct ProcessHandle(Arc<Mutex<Option<i32>>>);
+
+#[cfg(target_os = "macos")]
+impl ProcessHandle {
+    /// Requests SIGKILL while the original PID is reserved by the unreaped child.
+    pub fn kill(&self) -> io::Result<()> {
+        let identity = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(pid) = *identity {
+            // SAFETY: the reap lock keeps this PID bound to the original child.
+            unsafe { libc::kill(pid, libc::SIGKILL).syscall_result()? };
+        }
+        Ok(())
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl ProcessHandle {

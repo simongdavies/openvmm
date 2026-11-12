@@ -74,8 +74,8 @@ use zerocopy::IntoBytes;
 /// simultaneously.
 const USE_SEQPACKET: bool = cfg!(target_os = "linux");
 
-/// The maximum packet size. Linux uses memfd to send data larger than this.
-/// Other OSes just fail, so choose a larger size.
+/// The inline packet size. Linux uses memfd for larger events.
+/// Stream sockets grow their receive buffer to the framed message size.
 ///
 /// These values were chosen arbitrarily and have not been tested for
 /// performance.
@@ -471,7 +471,7 @@ impl SendEvent for PacketSender {
 
 fn serialize_event(event: OutgoingEvent<'_>) -> io::Result<(Vec<u8>, Vec<OsResource>)> {
     // Serialize the event to a memfd if it's too large to send inline.
-    if event.len() > MAX_SMALL_EVENT_SIZE {
+    if USE_SEQPACKET && event.len() > MAX_SMALL_EVENT_SIZE {
         return serialize_large_event(event);
     }
 
@@ -1063,7 +1063,9 @@ impl UnixSocket {
         if USE_SEQPACKET {
             self.send_raw(&mut [IoSlice::new(msg)], fds).await?;
         } else {
-            let len = (msg.len() as u32).to_le_bytes();
+            let len = u32::try_from(msg.len())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EMSGSIZE))?
+                .to_le_bytes();
             let mut iov = [IoSlice::new(&len), IoSlice::new(msg)];
             self.send_all_raw(&mut iov, fds).await?;
         }
@@ -1119,7 +1121,7 @@ impl UnixSocket {
 
     async fn recv(
         &self,
-        buf: &mut [u8],
+        buf: &mut Vec<u8>,
         fds: &mut Vec<OsResource>,
         receiver: &mut unix_socket::ScmReceiver,
     ) -> io::Result<usize> {
@@ -1131,6 +1133,11 @@ impl UnixSocket {
                 return Ok(0);
             }
             let len = u32::from_le_bytes(len) as usize;
+            if len > buf.len() {
+                buf.try_reserve_exact(len - buf.len())
+                    .map_err(io::Error::other)?;
+                buf.resize(len, 0);
+            }
             let buf = buf
                 .get_mut(..len)
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EMSGSIZE))?;
@@ -1211,7 +1218,6 @@ mod tests {
         leader.shutdown().await;
     }
 
-    #[cfg(target_os = "linux")]
     #[async_test]
     async fn test_huge_message(driver: DefaultDriver) {
         let leader = UnixNode::new(driver.clone());
@@ -1222,10 +1228,12 @@ mod tests {
             .await
             .unwrap();
 
-        let v = vec![0xcc; 16 << 20];
-        send.send(v.clone());
-        let v2 = recv2.recv().await.unwrap();
-        assert_eq!(v, v2);
+        for size in [17 << 20, 1, super::MAX_SMALL_EVENT_SIZE + 1, 0] {
+            let v = vec![0xcc; size];
+            send.send(v.clone());
+            let v2 = recv2.recv().await.unwrap();
+            assert_eq!(v, v2);
+        }
         follower.shutdown().await;
         leader.shutdown().await;
     }

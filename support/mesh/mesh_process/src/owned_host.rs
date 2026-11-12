@@ -15,17 +15,17 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 type Child = pal::unix::process::Child;
 #[cfg(windows)]
 type Child = pal::windows::Process;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 type Identity = pal::unix::process::ProcessHandle;
 #[cfg(windows)]
 type Identity = pal::windows::Process;
 
 /// Actual root OS exit status, not a transport or worker-protocol notification.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub type RootExit = std::process::ExitStatus;
 /// Actual root OS exit code, not a transport or worker-protocol notification.
 #[cfg(windows)]
@@ -124,9 +124,9 @@ impl PreparedRoot {
     ) -> io::Result<OwnedHost> {
         #[cfg(windows)]
         let pid = child.id() as i32;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let pid = child.id();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let identity = child.termination_handle();
         #[cfg(windows)]
         let identity = child
@@ -190,12 +190,12 @@ impl std::error::Error for RetainedWaitError {
 /// Exclusive launch ownership of a root process.
 ///
 /// Dropping this object requests root termination. Call [`Self::wait_root`]
-/// for actual OS exit (and Linux reap) evidence. Neither operation proves that
+/// for actual OS exit and Unix reap evidence. Neither operation proves that
 /// descendants have exited. Whole-domain cleanup requires an external,
 /// independently owned containment backend; it is not implemented here.
 ///
-/// The pid is diagnostic only. Termination always uses the retained pidfd or
-/// process handle, including after exit and PID reuse.
+/// The pid is diagnostic only. Termination uses a retained pidfd, process handle,
+/// or the macOS child's synchronized reap lock.
 pub struct OwnedHost {
     pid: i32,
     identity: Identity,
@@ -221,7 +221,7 @@ impl OwnedHost {
         if *requested {
             return Ok(());
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         self.identity.kill()?;
         #[cfg(windows)]
         if let Err(error) = self.identity.kill(1) {
@@ -233,7 +233,7 @@ impl OwnedHost {
         Ok(())
     }
 
-    /// Waits for actual root OS exit and, on Linux, reaping. Cancellation and
+    /// Waits for actual root OS exit and Unix reaping. Cancellation and
     /// repeated waits do not consume the recorded result.
     pub async fn wait_root(&mut self) -> io::Result<RootExit> {
         self.exit
@@ -285,7 +285,7 @@ impl Drop for OwnedHost {
 }
 
 fn wait(child: &mut Child) -> io::Result<RootExit> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         loop {
             match child.wait() {
@@ -301,7 +301,7 @@ fn wait(child: &mut Child) -> io::Result<RootExit> {
 }
 
 fn terminate(child: &Child) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     child.kill()?;
     #[cfg(windows)]
     if let Err(error) = child.kill(1) {
@@ -459,7 +459,7 @@ pub(crate) mod tests {
         assert!(sibling.wait_root().now_or_never().is_none());
         let status = bounded(&driver, host.wait_root()).await.unwrap();
         assert_eq!(host.wait_root().await.unwrap(), status);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
             assert_eq!(status.signal(), Some(libc::SIGKILL));
@@ -490,7 +490,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let natural_status = bounded(&driver, exited.wait_root()).await.unwrap();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         assert_eq!(natural_status.code(), Some(7));
         #[cfg(windows)]
         assert_eq!(natural_status, 7);
@@ -501,6 +501,39 @@ pub(crate) mod tests {
         sibling.terminate_root().unwrap();
         bounded(&driver, sibling.wait_root()).await.unwrap();
         bounded(&driver, mesh.shutdown()).await;
+    }
+
+    #[async_test]
+    async fn sibling_owners_share_ports_and_shutdown_independently(driver: DefaultDriver) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let parent = Mesh::new("sibling-parent".into()).unwrap();
+        let first_mesh = parent.new_sibling("first-owner".into()).unwrap();
+        let second_mesh = parent.new_sibling("second-owner".into()).unwrap();
+        let (sender, _receiver) = mesh::channel::<u32>();
+        let mut first_host = bounded(
+            &driver,
+            first_mesh.launch_host_owned(config(&first), sender.clone()),
+        )
+        .await
+        .unwrap();
+        let mut second_host = bounded(
+            &driver,
+            second_mesh.launch_host_owned(config(&second), sender),
+        )
+        .await
+        .unwrap();
+        ready(&driver, &first).await;
+        ready(&driver, &second).await;
+        bounded(&driver, parent.shutdown()).await;
+        first_host.terminate_root().unwrap();
+        bounded(&driver, first_host.wait_root()).await.unwrap();
+        bounded(&driver, first_mesh.shutdown()).await;
+        assert!(second_host.wait_root().now_or_never().is_none());
+        second_host.terminate_root().unwrap();
+        bounded(&driver, second_host.wait_root()).await.unwrap();
+        bounded(&driver, second_mesh.shutdown()).await;
     }
 
     #[async_test]

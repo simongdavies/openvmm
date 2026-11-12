@@ -59,17 +59,18 @@ use std::os::windows::prelude::*;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use tracing::Instrument;
 use tracing::instrument;
 use unicycle::FuturesUnordered;
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod owned_host;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub use owned_host::{OwnedHost, RootExit};
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod pending_host;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub use pending_host::{LaunchCompletion, PendingHostLaunch};
 
 #[cfg(windows)]
@@ -442,6 +443,10 @@ pub struct Mesh {
     request: mesh::Sender<MeshRequest>,
     #[inspect(skip)]
     task: Task<()>,
+    #[inspect(skip)]
+    node: Arc<IpcNode>,
+    #[inspect(skip)]
+    node_driver: IpcNodeDriver,
 }
 
 /// Sandbox profile trait used for mesh hosts.
@@ -679,7 +684,7 @@ struct MeshInner {
     /// Handles for spawned host processes.
     waiters: FuturesUnordered<Task<usize>>,
     /// Mesh node for host process communication.
-    node: IpcNode,
+    node: Arc<IpcNode>,
     /// IO driver for the mesh node, used for listener accept loops,
     /// handshakes, and general async task spawning. This is the same
     /// driver that was passed to the node on creation.
@@ -716,31 +721,23 @@ struct NewHostParams {
     recv: Port,
     request_send: mesh::Sender<HostRequest>,
     owned: bool,
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     launch: Option<pending_host::LaunchGuard>,
-    #[cfg(all(test, any(windows, target_os = "linux")))]
+    #[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
     test_hooks: Option<pending_host::LaunchTestHooks>,
 }
 
 enum LaunchedHost {
     Legacy(i32),
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     Owned(OwnedHost),
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     Pending,
 }
 
 impl Mesh {
     /// Creates a new mesh with the given name.
     pub fn new(mesh_name: String) -> anyhow::Result<Self> {
-        #[cfg(windows)]
-        let job = {
-            let job = pal::windows::job::Job::new().context("failed to create job object")?;
-            job.set_terminate_on_close()
-                .context("failed to set job object terminate on close")?;
-            job
-        };
-
         #[cfg(windows)]
         let (node, node_driver) = {
             let driver = pal_async::windows::TpPool::system();
@@ -759,13 +756,36 @@ impl Mesh {
             (node, driver)
         };
 
+        Self::with_node(mesh_name, Arc::new(node), node_driver)
+    }
+
+    /// Creates an independent process owner sharing this Mesh's local IPC node.
+    ///
+    /// Ports can cross between these owners. Shutdown waits only for processes
+    /// launched through that owner, not its siblings.
+    pub fn new_sibling(&self, mesh_name: String) -> anyhow::Result<Self> {
+        Self::with_node(mesh_name, self.node.clone(), self.node_driver.clone())
+    }
+
+    fn with_node(
+        mesh_name: String,
+        node: Arc<IpcNode>,
+        node_driver: IpcNodeDriver,
+    ) -> anyhow::Result<Self> {
+        #[cfg(windows)]
+        let job = {
+            let job = pal::windows::job::Job::new().context("failed to create job object")?;
+            job.set_terminate_on_close()
+                .context("failed to set job object terminate on close")?;
+            job
+        };
         let (request, requests) = mesh::channel();
 
         let mut inner = MeshInner {
             requests,
             hosts: Default::default(),
             waiters: Default::default(),
-            node,
+            node: node.clone(),
             node_driver: node_driver.clone(),
             mesh_name: mesh_name.clone(),
             #[cfg(windows)]
@@ -781,6 +801,8 @@ impl Mesh {
             request,
             mesh_name,
             task,
+            node,
+            node_driver,
         })
     }
 
@@ -801,7 +823,7 @@ impl Mesh {
             .await?
         {
             LaunchedHost::Legacy(pid) => Ok(pid),
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             LaunchedHost::Owned(_) | LaunchedHost::Pending => {
                 unreachable!("requested legacy launch")
             }
@@ -816,7 +838,7 @@ impl Mesh {
     /// exit/reap, not descendant cleanup. Cancellation of the launch future also
     /// requests cancellation. Use [`Self::begin_launch_host_owned`] to retain
     /// completion evidence after cancelling launch or receiving an error.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     pub async fn launch_host_owned<T: 'static + MeshField + Send>(
         &self,
         config: ProcessConfig,
@@ -832,7 +854,7 @@ impl Mesh {
     /// The receipt is established before dispatch. Keep it across deadlines
     /// and errors, request cancellation, and observe its root completion before
     /// releasing prepared resources. Domain-empty evidence is separate.
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     pub fn begin_launch_host_owned<T: 'static + MeshField + Send>(
         &self,
         config: ProcessConfig,
@@ -846,7 +868,7 @@ impl Mesh {
         )
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     fn begin_owned<T: 'static + MeshField + Send>(
         &self,
         config: ProcessConfig,
@@ -906,9 +928,9 @@ impl Mesh {
                     recv: init_recv.into(),
                     request_send,
                     owned,
-                    #[cfg(any(windows, target_os = "linux"))]
+                    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
                     launch: None,
-                    #[cfg(all(test, any(windows, target_os = "linux")))]
+                    #[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
                     test_hooks: None,
                 }),
             )
@@ -1219,11 +1241,11 @@ impl MeshInner {
     }
 
     async fn launch_request(&mut self, params: NewHostParams) -> anyhow::Result<LaunchedHost> {
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
             self.spawn_process(params).await
         }
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             let mut params = params;
             let launch = params.launch.take();
@@ -1283,16 +1305,18 @@ impl MeshInner {
     async fn spawn_process(
         &mut self,
         params: NewHostParams,
-        #[cfg(any(windows, target_os = "linux"))] launch: Option<&pending_host::LaunchGuard>,
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))] launch: Option<
+            &pending_host::LaunchGuard,
+        >,
     ) -> anyhow::Result<LaunchedHost> {
         let NewHostParams {
             config,
             recv,
             request_send,
             owned,
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
                 launch: _,
-            #[cfg(all(test, any(windows, target_os = "linux")))]
+            #[cfg(all(test, any(windows, target_os = "linux", target_os = "macos")))]
                 test_hooks: _,
         } = params;
         anyhow::ensure!(
@@ -1314,7 +1338,7 @@ impl MeshInner {
             }),
             "process configuration must not override the Mesh invitation"
         );
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let _ = owned;
 
         let pid;
@@ -1517,7 +1541,6 @@ impl MeshInner {
 
             // Launch the child process on a separate thread to isolate
             // the fork() call from other IO pools.
-            #[cfg(target_os = "linux")]
             let prepared = owned
                 .then(owned_host::PreparedRoot::new)
                 .transpose()
@@ -1535,6 +1558,10 @@ impl MeshInner {
                                 .map_err(process::SpawnError::into_parts);
                         }
                     }
+                    #[cfg(target_os = "macos")]
+                    if let Some(launch) = launch {
+                        launch.enter_native().map_err(|error| (error, None))?;
+                    }
                     command.spawn().map_err(|error| (error, None))
                 })?;
                 thread
@@ -1545,7 +1572,6 @@ impl MeshInner {
             let child = match result {
                 Ok(child) => child,
                 Err((error, failed_child)) => {
-                    #[cfg(target_os = "linux")]
                     if let Some(launch) = launch {
                         if let Some(child) = failed_child {
                             let prepared = prepared.expect("owned launch reserved a reaper");
@@ -1555,12 +1581,9 @@ impl MeshInner {
                             launch.no_root();
                         }
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    let _: Option<process::Child> = failed_child;
                     return Err(error).context("failed to launch mesh process");
                 }
             };
-            #[cfg(target_os = "linux")]
             if owned {
                 let prepared = prepared.expect("owned launch reserved a reaper");
                 launch
@@ -1595,7 +1618,7 @@ impl MeshInner {
         Ok(LaunchedHost::Legacy(pid))
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     fn track_owned_host(
         &mut self,
         host: &OwnedHost,
@@ -1721,7 +1744,7 @@ mod tests {
             format!("{error:#}").contains("test profile setup failed"),
             "{error:#}"
         );
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         {
             let error = mesh.launch_host_owned(config(), ()).await.err().unwrap();
             assert!(

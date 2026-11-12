@@ -182,7 +182,7 @@ async fn native_creation_failure_reports_actual_birth_state(driver: DefaultDrive
     );
     assert!(bounded(&driver, pending.wait_host()).await.is_err());
     let completion = bounded(&driver, pending.wait_completion()).await.unwrap();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     assert_eq!(completion, LaunchCompletion::NeverSpawned);
     #[cfg(target_os = "linux")]
     assert!(matches!(completion, LaunchCompletion::RootExited(_)));

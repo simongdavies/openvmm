@@ -108,6 +108,10 @@ impl Builder<'_> {
         if r != 0 {
             return Err(io::Error::from_raw_os_error(r));
         }
-        Ok(Child { pid, status: None })
+        Ok(Child {
+            pid,
+            identity: std::sync::Arc::new(std::sync::Mutex::new(Some(pid))),
+            status: None,
+        })
     }
 }

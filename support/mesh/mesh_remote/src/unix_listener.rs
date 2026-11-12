@@ -15,6 +15,8 @@ use crate::unix_node::InviteError;
 use crate::unix_node::JoinError;
 use crate::unix_node::UnixMeshInviter;
 use crate::unix_node::UnixNode;
+#[cfg(target_os = "macos")]
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use mesh_node::local_node::Port;
 use mesh_node::message::MeshPayload;
 use mesh_node::resource::OsResource;
@@ -152,6 +154,21 @@ async fn send_serialized(
         sent += n;
     }
 
+    #[cfg(target_os = "macos")]
+    if !fds.is_empty() {
+        // Keep socket descriptors alive until SCM_RIGHTS delivery is acknowledged.
+        let mut acknowledgement = [0];
+        stream
+            .read_exact(&mut acknowledgement)
+            .await
+            .map_err(SendPayloadError::Io)?;
+        if acknowledgement != [1] {
+            return Err(SendPayloadError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid descriptor delivery acknowledgement",
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -216,6 +233,11 @@ async fn recv_serialized(
             expected: fd_count,
             actual: fds.len(),
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    if !fds.is_empty() {
+        stream.write_all(&[1]).await.map_err(RecvPayloadError::Io)?;
     }
 
     // Move the received fds out as mesh resources.

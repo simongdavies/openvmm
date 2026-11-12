@@ -142,7 +142,7 @@ async fn injected_failure_after_ready_child_preserves_exit(driver: DefaultDriver
     };
     #[cfg(windows)]
     assert_eq!(status, 1);
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
